@@ -1,8 +1,6 @@
 # Teely
 
-Teely is a local app launcher for macOS with friendly hostnames, on-demand startup, and built-in HTTPS.
-
-Teely tees up your local apps, Caddy handles the rest.
+Teely is a local serverless launcher for macOS web apps that tees them up with friendly hostnames, on-demand startup, and built-in HTTPS, with Caddy handling the rest.
 
 ![Teely flow](docs/teely-flow.png)
 
@@ -23,6 +21,7 @@ If `teely.local.json` does not exist yet, the first run creates it and asks you 
 
 - friendly local hostnames like `https://sample-app.localhost`
 - starts apps on demand
+- bridges cold starts automatically so first requests can complete cleanly
 - shows a startup page while an app is booting
 - routes traffic through local HTTPS with Caddy
 - stops apps after idle timeout
