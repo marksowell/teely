@@ -1,0 +1,23 @@
+{
+  "listen_address": "127.0.0.1:8417",
+  "admin_hostname": "teely.localhost",
+  "runtime_dir": ".teely",
+  "caddy": {
+    "binary_path": ".teely/bin/caddy",
+    "caddyfile_path": ".teely/caddy/Caddyfile"
+  },
+  "apps": [
+    {
+      "id": "sample-app",
+      "name": "Sample App",
+      "hostname": "sample-app.localhost",
+      "working_dir": "/absolute/path/to/your-app",
+      "command": "./start.sh",
+      "port": 3000,
+      "health_path": "/",
+      "health_method": "GET",
+      "idle_timeout": "20m",
+      "startup_timeout": "90s"
+    }
+  ]
+}

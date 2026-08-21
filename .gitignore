@@ -1,0 +1,25 @@
+teely
+
+# Local Teely configs
+teely.local.json
+*.local.json
+
+# Local environment and secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# Local runtime state
+.teely/
+tmp/
+logs/
+*.log
+*.pid
+*.sock
+
+# Local TLS / proxy state if kept inside the repo
+caddy/
+certs/
+certificates/
+tls/
