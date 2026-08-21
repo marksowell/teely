@@ -1,5 +1,7 @@
 # Teely
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/marksowell/teely.svg)](https://pkg.go.dev/github.com/marksowell/teely)
+
 Teely is a local serverless launcher for macOS web apps that tees them up with friendly hostnames, on-demand startup, and built-in HTTPS, with Caddy handling the rest.
 
 ![Teely flow](docs/teely-flow.png)
