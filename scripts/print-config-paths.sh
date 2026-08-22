@@ -27,6 +27,8 @@ if not os.path.isabs(runtime_dir):
 caddy = cfg.get("caddy") or {}
 binary_path = caddy.get("binary_path") or os.path.join(runtime_dir, "bin", "caddy")
 caddyfile_path = caddy.get("caddyfile_path") or os.path.join(runtime_dir, "caddy", "Caddyfile")
+listen_address = cfg.get("listen_address") or "127.0.0.1:8417"
+listen_port = listen_address.rsplit(":", 1)[-1]
 if not os.path.isabs(binary_path):
     binary_path = os.path.normpath(os.path.join(base_dir, binary_path))
 if not os.path.isabs(caddyfile_path):
@@ -35,4 +37,5 @@ if not os.path.isabs(caddyfile_path):
 print(f'RUNTIME_DIR="{runtime_dir}"')
 print(f'CADDY_BINARY_PATH="{binary_path}"')
 print(f'CADDYFILE_PATH="{caddyfile_path}"')
+print(f'TEELY_LISTEN_PORT="{listen_port}"')
 PY

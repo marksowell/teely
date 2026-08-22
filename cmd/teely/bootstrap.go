@@ -339,6 +339,29 @@ func stopFromPIDFile(pidFile, name string) {
 	_ = os.Remove(pidFile)
 }
 
+func stopManagedProcess(pidFile, name, port string) {
+	stopFromPIDFile(pidFile, name)
+	if strings.TrimSpace(port) == "" {
+		return
+	}
+	pid := listenerPID(port)
+	if pid == 0 {
+		return
+	}
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		_ = process.Signal(syscall.SIGTERM)
+		for i := 0; i < 10; i++ {
+			if err := process.Signal(syscall.Signal(0)); err != nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		_ = process.Kill()
+		fmt.Printf("Stopped %s listener on port %s (pid %d)\n", name, port, pid)
+	}
+}
+
 func reportStatus(pidFile, name string) {
 	if pid, ok := runningPID(pidFile); ok {
 		fmt.Printf("%s: running (pid %d)\n", name, pid)

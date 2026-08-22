@@ -214,7 +214,7 @@ func runDown(args []string) {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	stopFromPIDFile(filepath.Join(cfg.RuntimeDir, "run", "teely.pid"), "Teely")
+	stopManagedProcess(filepath.Join(cfg.RuntimeDir, "run", "teely.pid"), "Teely", listenPort(cfg.ListenAddress))
 	stopFromPIDFile(filepath.Join(cfg.RuntimeDir, "run", "caddy.pid"), "Caddy")
 }
 

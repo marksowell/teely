@@ -2,6 +2,7 @@ package teely
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"time"
 )
+
+//go:embed teely-icon.png
+var teelyIconPNG []byte
 
 type HTTPServer struct {
 	manager *Manager
@@ -78,6 +82,14 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.Method == http.MethodGet && r.URL.Path == "/__teely/apps":
 		writeJSON(w, http.StatusOK, m.ListApps())
+		return
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/__teely/icon.png":
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store, max-age=0")
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = w.Write(teelyIconPNG)
 		return
 	case r.Method == http.MethodGet && r.URL.Path == "/__teely/caddyfile":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -352,6 +364,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Teely</title>
+  <link rel="icon" type="image/png" href="/__teely/icon.png">
   <style>
     :root {
       color-scheme: light;
@@ -380,6 +393,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       --radius-sm: 10px;
       --font-ui: "SF Pro Text", "SF Pro Display", "Helvetica Neue", -apple-system, BlinkMacSystemFont, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --shell-top-space: 68px;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
@@ -441,13 +455,20 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .shell { max-width: 1320px; margin: 0 auto; padding: 68px 20px 20px; }
+    .shell {
+      max-width: 1320px;
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: var(--shell-top-space) 20px 20px;
+      display: flex;
+      flex-direction: column;
+    }
     .topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      padding: 18px 24px;
+      padding: 14px 24px;
       border-bottom: 1px solid var(--line);
       background: color-mix(in srgb, var(--bg) 78%, rgba(255,251,244,0.72) 22%);
       backdrop-filter: blur(18px);
@@ -457,6 +478,20 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       left: 0;
       right: 0;
       z-index: 20;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      flex: 0 0 auto;
+      display: block;
+      box-shadow: 0 8px 18px rgba(21,49,31,0.12);
     }
     .brand-copy h1 { margin: 0; font-size: 24px; line-height: 1.05; font-weight: 700; }
     .brand-copy p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
@@ -493,6 +528,32 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
     }
     .main { display: grid; gap: 16px; margin-top: 8px; }
+    .footer {
+      display: flex;
+      justify-content: center;
+      margin-top: auto;
+      padding: 18px 0 10px;
+    }
+    .footer-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: color 120ms ease;
+    }
+    .footer-link:hover {
+      color: var(--text);
+      text-decoration: none;
+    }
+    .footer-link svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+      flex: 0 0 auto;
+    }
     .stats {
       display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0;
       border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 86%, transparent);
@@ -718,10 +779,22 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       .setup-actions { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
-      .shell { padding: 68px 14px 14px; }
-      .topbar { padding: 16px; }
-      .toolbar { justify-content: flex-start; }
-      .field-grid, .stats, .detail-grid { grid-template-columns: 1fr; }
+      .shell { padding: var(--shell-top-space) 14px 14px; }
+      .topbar {
+        padding: 12px 16px;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+      }
+      .brand { width: 100%; }
+      .toolbar {
+        width: 100%;
+        justify-content: flex-start;
+        gap: 8px;
+      }
+      .chip, .theme-toggle { font-size: 11px; }
+      .field-grid, .detail-grid { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .modal-shell { padding: 14px; }
     }
   </style>
@@ -730,6 +803,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   <div class="shell">
     <header class="topbar">
       <div class="brand">
+        <img class="brand-mark" src="/__teely/icon.png" alt="Teely icon">
         <div class="brand-copy">
           <h1>Teely</h1>
         </div>
@@ -876,6 +950,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         </aside>
       </section>
     </main>
+    <footer class="footer">
+      <a class="footer-link" href="https://github.com/marksowell/teely" target="_blank" rel="noreferrer">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 0C3.58 0 0 3.67 0 8.2c0 3.63 2.29 6.7 5.47 7.79.4.08.55-.18.55-.39 0-.19-.01-.82-.01-1.49-2.01.38-2.53-.5-2.69-.96-.09-.24-.48-.96-.82-1.15-.28-.16-.68-.55-.01-.56.63-.01 1.08.59 1.23.84.72 1.24 1.87.89 2.33.68.07-.53.28-.89.5-1.1-1.78-.21-3.64-.92-3.64-4.08 0-.9.31-1.64.82-2.22-.08-.2-.36-1.04.08-2.17 0 0 .67-.22 2.2.85A7.4 7.4 0 0 1 8 3.86c.68 0 1.37.09 2.01.27 1.53-1.07 2.2-.85 2.2-.85.44 1.13.16 1.97.08 2.17.51.58.82 1.31.82 2.22 0 3.17-1.87 3.87-3.65 4.08.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .22.14.48.55.39A8.19 8.19 0 0 0 16 8.2C16 3.67 12.42 0 8 0Z"/>
+        </svg>
+        <span>View Teely on GitHub</span>
+      </a>
+    </footer>
   </div>
 
   {{ if .ShowModal }}
@@ -937,14 +1019,25 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       const storageKey = "teely.theme";
       const root = document.documentElement;
       const select = document.getElementById("theme-select");
+      const topbar = document.querySelector(".topbar");
+      const syncHeaderOffset = () => {
+        if (!topbar) {
+          return;
+        }
+        const extra = 8;
+        const height = Math.ceil(topbar.getBoundingClientRect().height);
+        root.style.setProperty("--shell-top-space", String(height + extra) + "px");
+      };
       const applyTheme = (theme) => {
         root.dataset.theme = theme;
         if (select) {
           select.value = theme;
         }
       };
+      syncHeaderOffset();
       const saved = window.localStorage.getItem(storageKey) || "system";
       applyTheme(saved);
+      window.addEventListener("resize", syncHeaderOffset);
       if (select) {
         select.addEventListener("change", () => {
           const theme = select.value;
