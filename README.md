@@ -6,6 +6,8 @@ Teely is a local serverless launcher for macOS web apps that tees them up with f
 
 ![Teely flow](docs/teely-flow.png)
 
+![Teely dashboard](docs/teely-dashboard.png)
+
 ## Install
 
 ```bash
