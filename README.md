@@ -48,6 +48,17 @@ Then open:
 - works with local app commands directly instead of requiring containers
 - gives you a built-in dashboard for setup, status, logs, and controls
 
+## Related Projects
+
+Closest projects in this space include [Coulson](https://github.com/ratazzi/coulson), [Tako](https://tako.sh/docs/development/), and [puma-dev](https://github.com/puma/puma-dev). Teely is aimed at the same wake-on-request local workflow, with a built-in dashboard and plain local app commands.
+
+| Project | Start on request | Stop on idle | HTTPS / hostname | Arbitrary local process | macOS-oriented | UI |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Teely** | ✅ | ✅ | ✅ Caddy + `.localhost` | ✅ | ✅ | ✅ |
+| **[Coulson](https://github.com/ratazzi/coulson)** | ✅ | ✅ | ✅ local domains | Partial | Somewhat | ✅ |
+| **[Tako](https://tako.sh/docs/development/)** | ✅ | ✅ | ✅ trusted HTTPS + `.test` | Partial | Somewhat | CLI |
+| **[puma-dev](https://github.com/puma/puma-dev)** | ✅ | ✅ | ✅ HTTPS + local domains | Partial | ✅ | ❌ |
+
 ## Common Commands
 
 ```bash
