@@ -65,3 +65,7 @@ teely down
 4. Open `https://teely.localhost` to manage apps
 
 Keep real machine paths and local app details in your local Teely config, not in the checked-in sample config.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
