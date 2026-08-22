@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/marksowell/teely.svg)](https://pkg.go.dev/github.com/marksowell/teely)
 
-**Teely — Local apps that run only when you use them.**
+**Teely - Local apps that run only when you use them.**
 
 Teely automatically starts local web applications when they receive an HTTP request, waits for them to become ready, forwards the original request through the cold start, and shuts them down again after they go idle.
 
