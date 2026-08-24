@@ -50,6 +50,7 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		apps := m.ListApps()
 		cfg := m.Config()
 		var editing *AppState
+		var deleting *AppState
 		showCreate := len(apps) == 0 || strings.TrimSpace(r.URL.Query().Get("add")) != ""
 		if editID := strings.TrimSpace(r.URL.Query().Get("edit")); editID != "" {
 			if app, ok := m.GetAppByID(editID); ok {
@@ -57,8 +58,15 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 				showCreate = false
 			}
 		}
+		if deleteID := strings.TrimSpace(r.URL.Query().Get("delete")); deleteID != "" {
+			if app, ok := m.GetAppByID(deleteID); ok {
+				deleting = &app
+				showCreate = false
+				editing = nil
+			}
+		}
 		formState := newDraftAppState(cfg)
-		showModal := showCreate || editing != nil
+		showModal := showCreate || editing != nil || deleting != nil
 		isEditing := editing != nil
 		if editing != nil {
 			formState = *editing
@@ -68,6 +76,7 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			Apps:            apps,
 			CaddySnippet:    m.CaddySnippet(),
 			Editing:         editing,
+			Deleting:        deleting,
 			Setup:           m.SetupState(),
 			Notice:          strings.TrimSpace(r.URL.Query().Get("notice")),
 			ErrorMessage:    strings.TrimSpace(r.URL.Query().Get("error")),
@@ -135,6 +144,22 @@ func (m *Manager) handleAppAction(w http.ResponseWriter, r *http.Request) {
 		err = m.StopApp(id)
 	case "restart":
 		err = m.RestartApp(id)
+	case "delete":
+		if err := r.ParseForm(); err != nil {
+			http.Redirect(w, r, "/?error="+urlpkg.QueryEscape(err.Error()), http.StatusSeeOther)
+			return
+		}
+		confirm := strings.TrimSpace(r.FormValue("confirm_id"))
+		app, ok := m.GetAppByID(id)
+		if !ok {
+			http.Redirect(w, r, "/?error="+urlpkg.QueryEscape(fmt.Sprintf("unknown app %q", id)), http.StatusSeeOther)
+			return
+		}
+		if confirm != app.Config.ID {
+			http.Redirect(w, r, "/?delete="+urlpkg.QueryEscape(id)+"&error="+urlpkg.QueryEscape("Type the app ID exactly to confirm deletion."), http.StatusSeeOther)
+			return
+		}
+		err = m.DeleteApp(id)
 	case "terminate-port-owner":
 		err = m.TerminatePortOwner(id)
 	default:
@@ -196,11 +221,37 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 		StartupTimeout:  strings.TrimSpace(r.FormValue("startup_timeout")),
 		CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
 	}
+	existing, exists := m.GetAppByID(app.ID)
+	wasActive := false
+	needsRestart := false
+	if exists {
+		wasActive = existing.Status == StatusRunning || existing.Status == StatusStarting
+		needsRestart = appRequiresRestart(existing.Config, app)
+	}
 	if err := m.UpsertApp(app); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if exists && wasActive && needsRestart {
+		if err := m.StopApp(app.ID); err != nil && err != errAlreadyStopped {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := m.StartApp(app.ID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func appRequiresRestart(before AppConfig, after AppConfig) bool {
+	return strings.TrimSpace(before.WorkingDir) != strings.TrimSpace(after.WorkingDir) ||
+		strings.TrimSpace(before.Command) != strings.TrimSpace(after.Command) ||
+		before.Port != after.Port ||
+		strings.TrimSpace(before.CaddyDirectives) != strings.TrimSpace(after.CaddyDirectives) ||
+		strings.TrimSpace(before.HealthMethod) != strings.TrimSpace(after.HealthMethod) ||
+		strings.TrimSpace(before.HealthPath) != strings.TrimSpace(after.HealthPath)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -224,7 +275,7 @@ func newDraftAppState(cfg Config) AppState {
 		Config: AppConfig{
 			HealthMethod:    "GET",
 			HealthPath:      "/",
-			IdleTimeout:     "20m",
+			IdleTimeout:     "10m",
 			StartupTimeout:  "90s",
 			CaddyDirectives: defaultCaddyDirectives(cfg.ListenAddress),
 		},
@@ -240,7 +291,11 @@ func renderAppCaddyBlock(app AppConfig, listenAddress string) string {
 	if directives == "" {
 		directives = defaultCaddyDirectives(listenAddress)
 	}
-	return app.Hostname + " {\n\t" + strings.ReplaceAll(directives, "\n", "\n\t") + "\n}"
+	hostname := strings.TrimSpace(app.Hostname)
+	if hostname == "" {
+		hostname = "<hostname>"
+	}
+	return hostname + " {\n\t" + strings.ReplaceAll(directives, "\n", "\n\t") + "\n}"
 }
 
 type dashboardView struct {
@@ -248,6 +303,7 @@ type dashboardView struct {
 	Apps            []AppState
 	CaddySnippet    string
 	Editing         *AppState
+	Deleting        *AppState
 	Setup           SetupState
 	Notice          string
 	ErrorMessage    string
@@ -258,6 +314,10 @@ type dashboardView struct {
 	RunningCount    int
 	StartingCount   int
 	ErrorCount      int
+}
+
+func restartRequiredForView(app AppState) bool {
+	return app.Status == StatusRunning || app.Status == StatusStarting
 }
 
 func renderDashboard(w http.ResponseWriter, view dashboardView) {
@@ -350,7 +410,8 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
 		}
 		return value.Format("2006-01-02 15:04:05")
 	},
-	"renderAppCaddyBlock": renderAppCaddyBlock,
+	"restartRequiredForView": restartRequiredForView,
+	"renderAppCaddyBlock":    renderAppCaddyBlock,
 	"toJSON": func(value any) template.JS {
 		data, err := json.Marshal(value)
 		if err != nil {
@@ -667,6 +728,15 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     button.secondary, .button-link.secondary {
       background: var(--panel-muted); color: var(--text); border: 1px solid var(--line); box-shadow: none;
     }
+    button.danger, .button-link.danger {
+      background: color-mix(in srgb, var(--red) 88%, #8e1f18 12%);
+      color: white;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+    }
+    button.danger:hover, .button-link.danger:hover {
+      background: color-mix(in srgb, var(--red) 94%, #6f160f 6%);
+      text-decoration: none;
+    }
     form.inline { margin: 0; }
     .notice-wrap {
       display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
@@ -674,6 +744,64 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     }
     .notice { line-height: 1.45; }
     .notice.error-banner { background: var(--red-soft); }
+    .notice.danger-banner {
+      background: color-mix(in srgb, var(--red-soft) 78%, var(--panel-strong));
+      border: 1px solid color-mix(in srgb, var(--red) 18%, transparent);
+      color: color-mix(in srgb, var(--text) 80%, var(--red) 20%);
+    }
+    .danger-panel {
+      display: grid;
+      gap: 14px;
+      padding: 16px 18px;
+      border: 1px solid color-mix(in srgb, var(--red) 14%, transparent);
+      border-radius: 14px;
+      background:
+        linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 88%, transparent), color-mix(in srgb, var(--red-soft) 18%, transparent)),
+        color-mix(in srgb, var(--panel-strong) 92%, var(--red-soft) 8%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+    }
+    .danger-kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--red);
+    }
+    .danger-kicker::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+      box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 14%, transparent);
+    }
+    .danger-copy {
+      display: grid;
+      gap: 8px;
+    }
+    .danger-copy h3 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.2;
+      color: var(--text);
+    }
+    .danger-copy p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .danger-confirm {
+      display: grid;
+      gap: 10px;
+    }
+    .danger-confirm .mono {
+      width: fit-content;
+      max-width: 100%;
+    }
     .setup-list { display: grid; gap: 10px; }
     .setup-item {
       display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; align-items: start; padding: 14px;
@@ -730,6 +858,64 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       gap: 16px;
       align-content: start;
     }
+    details.advanced-options {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    details.advanced-options {
+      background: color-mix(in srgb, var(--green-soft) 44%, var(--panel-strong));
+    }
+    details.advanced-options summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 11px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    details.advanced-options summary::-webkit-details-marker { display: none; }
+    details.advanced-options summary::after {
+      content: "+";
+      font-size: 16px;
+      color: var(--muted);
+      line-height: 1;
+    }
+    details.advanced-options[open] summary::after { content: "−"; }
+    .advanced-body {
+      display: grid;
+      gap: 14px;
+      padding: 0 14px 14px;
+    }
+    .advanced-section {
+      display: grid;
+      gap: 8px;
+      padding: 2px 0;
+    }
+    .advanced-section h3 {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.2;
+      color: var(--muted);
+    }
+    .advanced-section + .advanced-section {
+      padding-top: 4px;
+    }
+    .import-json-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .import-json-feedback[data-state="error"] {
+      color: var(--red);
+    }
+    .import-json-feedback[data-state="success"] {
+      color: var(--green);
+    }
     .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 22px; }
     label { display: grid; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); line-height: 1.2; }
     input, textarea {
@@ -742,7 +928,6 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
     }
     input[readonly] { opacity: 0.72; }
-    .caddy-preview { display: grid; gap: 10px; margin-top: 4px; }
     .code-note { line-height: 1.5; }
     pre {
       margin: 0; white-space: pre-wrap; overflow: auto; border-radius: 8px; border: 1px solid var(--line);
@@ -965,18 +1150,40 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     <div class="modal">
       <div class="modal-head">
         <div>
-          <h2>{{ if .IsEditing }}Edit App{{ else if .NeedsOnboarding }}Register Your First App{{ else }}Add App{{ end }}</h2>
-          <p>{{ if .IsEditing }}Update the app, route, and custom Caddy directives in one place.{{ else if .NeedsOnboarding }}Teely starts here. Add one app and the dashboard will collapse down to status and controls after setup.{{ else }}Add a new local app with its startup command, hostname, and Caddy routing directives.{{ end }}</p>
+          <h2>{{ if .Deleting }}Delete App{{ else if .IsEditing }}Edit App{{ else if .NeedsOnboarding }}Register Your First App{{ else }}Add App{{ end }}</h2>
+          <p>{{ if .Deleting }}Remove this app from Teely after confirming the app ID.{{ else if .IsEditing }}Update the app, route, and custom Caddy directives in one place.{{ else if .NeedsOnboarding }}Teely starts here. Add one app and the dashboard will collapse down to status and controls after setup.{{ else }}Add a new local app with its startup command, hostname, and Caddy routing directives.{{ end }}</p>
         </div>
         <div class="actions">
           {{ if not .NeedsOnboarding }}<a class="button-link secondary" href="/">Close</a>{{ end }}
         </div>
       </div>
       <div class="modal-body">
+        {{ if .Deleting }}
+        <form class="modal-form" method="post" action="/__teely/apps/{{ .Deleting.Config.ID }}/delete">
+          <div class="danger-panel">
+            <span class="danger-kicker">Permanent Action</span>
+            <div class="danger-copy">
+              <h3>{{ .Deleting.Config.Name }}</h3>
+              <p>This removes the app from Teely. Your project files stay on disk.</p>
+            </div>
+            <div class="danger-confirm">
+              <div class="subtle">Type this app ID to confirm deletion.</div>
+              <span class="mono">{{ .Deleting.Config.ID }}</span>
+            </div>
+          </div>
+          <label>App ID
+            <input name="confirm_id" placeholder="{{ .Deleting.Config.ID }}" autocomplete="off" required>
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="danger">Delete App</button>
+            <a class="button-link secondary" href="/">Cancel</a>
+          </div>
+        </form>
+        {{ else }}
         {{ if .IsEditing }}
-        <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. The app ID stays fixed so existing buttons and routes keep working.</div>
+        <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. Changing the hostname updates routing to the new URL after save.</div>
         {{ end }}
-        <form class="modal-form" method="post" action="/__teely/register">
+        <form class="modal-form" method="post" action="/__teely/register" {{ if .IsEditing }}data-original-app='{{ toJSON .FormState.Config }}' data-app-active="{{ if restartRequiredForView .FormState }}true{{ else }}false{{ end }}"{{ end }}>
           <div class="field-grid">
             <label>ID<input name="id" placeholder="sample-app" value="{{ .FormState.Config.ID }}" {{ if .IsEditing }}readonly{{ end }} required></label>
             <label>Name<input name="name" placeholder="Sample App" value="{{ .FormState.Config.Name }}"></label>
@@ -988,26 +1195,41 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           <label>Working Directory<input name="working_dir" placeholder="/absolute/path/to/your-app" value="{{ .FormState.Config.WorkingDir }}" required></label>
           <label>Command<input name="command" placeholder="./start.sh" value="{{ .FormState.Config.Command }}" required></label>
           <div class="field-grid">
-            <label>Idle Timeout<input name="idle_timeout" placeholder="20m" value="{{ .FormState.Config.IdleTimeout }}"></label>
+            <label>Idle Timeout<input name="idle_timeout" placeholder="10m" value="{{ .FormState.Config.IdleTimeout }}"></label>
             <label>Startup Timeout<input name="startup_timeout" placeholder="90s" value="{{ .FormState.Config.StartupTimeout }}"></label>
           </div>
           <div class="field-grid">
             <label>Health Method<input name="health_method" value="{{ .FormState.Config.HealthMethod }}"></label>
             <label>Health Path<input name="health_path" value="{{ .FormState.Config.HealthPath }}"></label>
           </div>
-          <label>Caddy Block
-            <textarea name="caddy_directives" spellcheck="false">{{ .FormState.Config.CaddyDirectives }}</textarea>
-          </label>
-          <div class="code-note">This is the body of the app's Caddy site block. Leave the default reverse proxy to {{ .Config.ListenAddress }} to keep Teely's on-demand startup flow in front of the app.</div>
-          <div class="caddy-preview">
-            <div class="code-note">{{ if .IsEditing }}Rendered block for this app{{ else }}Block that will be written for this app{{ end }}</div>
-            <pre>{{ renderAppCaddyBlock .FormState.Config .Config.ListenAddress }}</pre>
-          </div>
+          <details class="advanced-options">
+            <summary>Advanced (Optional)</summary>
+            <div class="advanced-body">
+              <div class="advanced-section">
+                <h3>Teely App JSON</h3>
+                <div class="code-note">Paste a Teely app JSON object here to populate this app's registration fields.</div>
+                <textarea data-app-json-source spellcheck="false" placeholder='{"id":"sample-app","name":"Sample App","hostname":"sample-app.localhost","working_dir":"/absolute/path/to/your-app","command":"./start.sh","port":3000}' aria-label="App JSON"></textarea>
+                <div class="import-json-actions">
+                  <div class="code-note import-json-feedback" data-app-json-feedback></div>
+                </div>
+              </div>
+              <div class="advanced-section">
+                <h3>Custom Caddy Directives</h3>
+                <div class="code-note">Add advanced Caddy directives for this app. Leave the default reverse proxy to {{ .Config.ListenAddress }} to keep Teely's on-demand startup flow in front of the app.</div>
+                <textarea name="caddy_directives" spellcheck="false" aria-label="Custom Caddy Directives">{{ .FormState.Config.CaddyDirectives }}</textarea>
+              </div>
+            </div>
+          </details>
+          {{ if .IsEditing }}
+          <div class="notice" data-restart-warning hidden>Changing the port, command, working directory, health check, or custom Caddy directives will stop and restart this app.</div>
+          {{ end }}
           <div class="form-actions">
-            <button type="submit">{{ if .IsEditing }}Save Changes{{ else if .NeedsOnboarding }}Save First App{{ else }}Save App{{ end }}</button>
+            <button type="submit" data-submit-label>{{ if .IsEditing }}Save Changes{{ else if .NeedsOnboarding }}Save First App{{ else }}Save App{{ end }}</button>
             {{ if not .NeedsOnboarding }}<a class="button-link secondary" href="/">Cancel</a>{{ end }}
+            {{ if .IsEditing }}<a class="button-link danger" href="/?delete={{ .FormState.Config.ID }}">Delete</a>{{ end }}
           </div>
         </form>
+        {{ end }}
       </div>
     </div>
   </div>
@@ -1098,6 +1320,134 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           }
         });
       }
+
+      const appFieldNames = [
+        "id",
+        "name",
+        "working_dir",
+        "command",
+        "port",
+        "health_path",
+        "health_method",
+        "idle_timeout",
+        "startup_timeout",
+        "caddy_directives",
+      ];
+      const pickAppObject = (value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return null;
+        }
+        return value;
+      };
+      const applyAppJSON = (form) => {
+        if (!form) {
+          return { ok: false, message: "Form not found." };
+        }
+        const source = form.querySelector("[data-app-json-source]");
+        const feedback = form.querySelector("[data-app-json-feedback]");
+        if (!source || !feedback) {
+          return { ok: false, message: "Importer not available." };
+        }
+        const raw = source.value.trim();
+        if (!raw) {
+          return { ok: false, message: "Paste JSON first." };
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (error) {
+          return { ok: false, message: "Invalid JSON: " + (error && error.message ? error.message : "parse failed") };
+        }
+        const app = pickAppObject(parsed);
+          if (!app) {
+            return { ok: false, message: "Expected one app JSON object." };
+          }
+        appFieldNames.forEach((name) => {
+          const input = form.querySelector("[name=\"" + name + "\"]");
+          if (!input || input.hasAttribute("readonly") || !(name in app)) {
+            return;
+          }
+          const value = app[name];
+          input.value = value === null || typeof value === "undefined" ? "" : String(value);
+        });
+        return { ok: true, message: "Applied JSON to the form." };
+      };
+      document.querySelectorAll("[data-app-json-source]").forEach((source) => {
+        const form = source.closest("form");
+        const feedback = form && form.querySelector("[data-app-json-feedback]");
+        if (!form || !feedback) {
+          return;
+        }
+        let applyTimer = null;
+        const syncFromJSON = () => {
+          const raw = source.value.trim();
+          if (!raw) {
+            feedback.textContent = "";
+            delete feedback.dataset.state;
+            return;
+          }
+          const result = applyAppJSON(form);
+          feedback.textContent = result.message;
+          feedback.dataset.state = result.ok ? "success" : "error";
+        };
+        source.addEventListener("input", () => {
+          if (applyTimer !== null) {
+            window.clearTimeout(applyTimer);
+          }
+          applyTimer = window.setTimeout(syncFromJSON, 250);
+        });
+        source.addEventListener("blur", syncFromJSON);
+        source.addEventListener("paste", () => {
+          window.setTimeout(syncFromJSON, 0);
+        });
+      });
+
+      const restartFields = [
+        "working_dir",
+        "command",
+        "port",
+        "health_method",
+        "health_path",
+        "caddy_directives",
+      ];
+      document.querySelectorAll("form[data-original-app]").forEach((form) => {
+        const originalJSON = form.getAttribute("data-original-app");
+        const submit = form.querySelector("[data-submit-label]");
+        const warning = form.querySelector("[data-restart-warning]");
+        const appActive = form.getAttribute("data-app-active") === "true";
+        if (!originalJSON || !submit || !warning) {
+          return;
+        }
+        let original = null;
+        try {
+          original = JSON.parse(originalJSON);
+        } catch (_) {
+          return;
+        }
+        const syncRestartState = () => {
+          const needsRestart = restartFields.some((name) => {
+            const input = form.querySelector("[name=\"" + name + "\"]");
+            if (!input) {
+              return false;
+            }
+            const current = String(input.value || "").trim();
+            const baseValue = original && Object.prototype.hasOwnProperty.call(original, name) ? original[name] : "";
+            const base = String(baseValue || "").trim();
+            return current !== base;
+          });
+          submit.textContent = needsRestart && appActive ? "Save and Restart" : "Save Changes";
+          warning.hidden = !(needsRestart && appActive);
+        };
+        restartFields.forEach((name) => {
+          const input = form.querySelector("[name=\"" + name + "\"]");
+          if (!input) {
+            return;
+          }
+          input.addEventListener("input", syncRestartState);
+          input.addEventListener("change", syncRestartState);
+        });
+        syncRestartState();
+      });
     })();
   </script>
 </body>

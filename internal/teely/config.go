@@ -25,18 +25,18 @@ type CaddyConfig struct {
 }
 
 type AppConfig struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Hostname       string            `json:"hostname"`
-	WorkingDir     string            `json:"working_dir"`
-	Command        string            `json:"command"`
-	Port           int               `json:"port"`
-	HealthPath     string            `json:"health_path"`
-	HealthMethod   string            `json:"health_method"`
-	IdleTimeout    string            `json:"idle_timeout"`
-	StartupTimeout string            `json:"startup_timeout"`
-	CaddyDirectives string           `json:"caddy_directives,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Hostname        string            `json:"hostname"`
+	WorkingDir      string            `json:"working_dir"`
+	Command         string            `json:"command"`
+	Port            int               `json:"port"`
+	HealthPath      string            `json:"health_path"`
+	HealthMethod    string            `json:"health_method"`
+	IdleTimeout     string            `json:"idle_timeout"`
+	StartupTimeout  string            `json:"startup_timeout"`
+	CaddyDirectives string            `json:"caddy_directives,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -107,7 +107,7 @@ func LoadConfig(path string) (*Config, error) {
 			app.HealthMethod = "GET"
 		}
 		if app.IdleTimeout == "" {
-			app.IdleTimeout = "20m"
+			app.IdleTimeout = "10m"
 		}
 		if app.StartupTimeout == "" {
 			app.StartupTimeout = "90s"
@@ -141,6 +141,31 @@ func SaveConfig(path string, cfg *Config) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(path, data, 0o644)
+}
+
+func cloneConfig(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	if cfg.Apps != nil {
+		cloned.Apps = make([]AppConfig, len(cfg.Apps))
+		for i, app := range cfg.Apps {
+			cloned.Apps[i] = cloneAppConfig(app)
+		}
+	}
+	return &cloned
+}
+
+func cloneAppConfig(app AppConfig) AppConfig {
+	cloned := app
+	if app.Env != nil {
+		cloned.Env = make(map[string]string, len(app.Env))
+		for key, value := range app.Env {
+			cloned.Env[key] = value
+		}
+	}
+	return cloned
 }
 
 func appParsedIdleTimeout(app AppConfig) (time.Duration, error) {

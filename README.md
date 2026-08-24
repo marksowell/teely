@@ -75,7 +75,40 @@ teely down
 3. Start Teely with `teely up`
 4. Open `https://teely.localhost` to manage apps
 
-Keep real machine paths and local app details in your local Teely config, not in the checked-in sample config.
+## Troubleshooting
+
+Check status first:
+
+```bash
+teely status
+```
+
+If routing or HTTPS is acting up, restart both processes:
+
+```bash
+teely restart
+```
+
+Teely keeps logs under your configured `runtime_dir`.
+
+Default install location:
+
+- `~/Library/Application Support/Teely/.teely/logs/teely.log`
+- `~/Library/Application Support/Teely/.teely/logs/caddy.log`
+
+If you run Teely from a repo-local config instead, those logs live under that config's local `.teely/logs/` directory.
+
+To temporarily enable Caddy debug logging, add `debug` to the top-level block in your generated Caddyfile, then restart Teely:
+
+```caddy
+{
+	debug
+	local_certs
+	skip_install_trust
+}
+```
+
+Remove `debug` again after you finish troubleshooting.
 
 ## License
 

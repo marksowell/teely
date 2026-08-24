@@ -11,14 +11,14 @@ PROJECT_ROOT=$(
 )
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${PLIST_DIR}/${LABEL}.plist"
-BINARY_PATH="${PROJECT_ROOT}/teely"
 CONFIG_PATH="${1:-${PROJECT_ROOT}/teely.local.json}"
+RUNNER_PATH="${PROJECT_ROOT}/scripts/launchd-run.sh"
 WORKDIR="${PROJECT_ROOT}"
 STDOUT_PATH="${TMPDIR:-/tmp}/teely.stdout.log"
 STDERR_PATH="${TMPDIR:-/tmp}/teely.stderr.log"
 
-if [ ! -x "$BINARY_PATH" ]; then
-  printf 'ERROR: Missing Teely binary at %s\n' "$BINARY_PATH" >&2
+if [ ! -x "${PROJECT_ROOT}/teely" ]; then
+  printf 'ERROR: Missing Teely binary at %s\n' "${PROJECT_ROOT}/teely" >&2
   printf 'Build it first with: ./scripts/build-teely.sh\n' >&2
   exit 1
 fi
@@ -42,8 +42,7 @@ cat > "$PLIST_PATH" <<EOF
 
     <key>ProgramArguments</key>
     <array>
-      <string>${BINARY_PATH}</string>
-      <string>-config</string>
+      <string>${RUNNER_PATH}</string>
       <string>${CONFIG_PATH}</string>
     </array>
 

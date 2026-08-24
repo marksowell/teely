@@ -83,6 +83,8 @@ type appRuntime struct {
 	mu           sync.Mutex
 	status       AppStatus
 	adopted      bool
+	managedPID   int
+	stopping     bool
 	cmd          *exec.Cmd
 	cancel       context.CancelFunc
 	waitDone     chan struct{}
@@ -251,6 +253,42 @@ func (m *Manager) RestartApp(id string) error {
 	return m.StartApp(id)
 }
 
+func (m *Manager) DeleteApp(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	index := -1
+	deletedHost := ""
+	for i := range m.config.Apps {
+		if m.config.Apps[i].ID == id {
+			index = i
+			deletedHost = strings.TrimSpace(m.config.Apps[i].Hostname)
+			break
+		}
+	}
+	if index == -1 {
+		return fmt.Errorf("unknown app %q", id)
+	}
+
+	if rt, ok := m.runtimes[id]; ok {
+		if err := rt.stop("deleted from Teely UI"); err != nil && !errors.Is(err, errAlreadyStopped) {
+			return err
+		}
+	}
+
+	next := cloneConfig(m.config)
+	next.Apps = append(next.Apps[:index], next.Apps[index+1:]...)
+	if err := m.commitConfigLocked(next); err != nil {
+		return err
+	}
+	if deletedHost != "" {
+		if err := removeLocalCaddyCertCache(deletedHost); err != nil {
+			log.Printf("warning: failed to remove cached Caddy cert for %s: %v", deletedHost, err)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) TerminatePortOwner(id string) error {
 	m.mu.RLock()
 	rt, ok := m.runtimes[id]
@@ -307,21 +345,28 @@ func (m *Manager) UpsertApp(app AppConfig) error {
 	}
 
 	found := false
-	for i := range m.config.Apps {
-		if m.config.Apps[i].ID == normalized.ID {
-			m.config.Apps[i] = normalized
+	next := cloneConfig(m.config)
+	previousHost := ""
+	for i := range next.Apps {
+		if next.Apps[i].ID == normalized.ID {
+			previousHost = strings.TrimSpace(next.Apps[i].Hostname)
+			next.Apps[i] = normalized
 			found = true
 			break
 		}
 	}
 	if !found {
-		m.config.Apps = append(m.config.Apps, normalized)
+		next.Apps = append(next.Apps, normalized)
+		previousHost = ""
 	}
-
-	if err := SaveConfig(m.configPath, m.config); err != nil {
+	if err := m.commitConfigLocked(next); err != nil {
 		return err
 	}
-	m.rebuildFromConfigLocked()
+	if previousHost != "" && !strings.EqualFold(previousHost, normalized.Hostname) {
+		if err := removeLocalCaddyCertCache(previousHost); err != nil {
+			log.Printf("warning: failed to remove cached Caddy cert for renamed host %s: %v", previousHost, err)
+		}
+	}
 	return nil
 }
 
@@ -329,17 +374,14 @@ func (m *Manager) SetupState() SetupState {
 	cfg := m.Config()
 	home, _ := os.UserHomeDir()
 	teelyLabel := teelyLaunchdLabel()
-	caddyLabel := teelyCaddyLaunchdLabel()
 	teelyPlist := filepath.Join(home, "Library", "LaunchAgents", teelyLabel+".plist")
-	caddyPlist := filepath.Join(home, "Library", "LaunchAgents", caddyLabel+".plist")
 	trustReady, trustDetail := caddyTrustStatus()
 	teelyLoginInstalled := fileExists(teelyPlist)
-	caddyLoginInstalled := fileExists(caddyPlist)
 	checks := []SetupCheck{
 		setupCheck(fileExists(cfg.Caddy.BinaryPath), "caddy_runtime", "Caddy Runtime", cfg.Caddy.BinaryPath, "install_caddy", "Install"),
 		setupCheck(fileExists(cfg.Caddy.CaddyfilePath), "caddyfile", "Generated Caddyfile", cfg.Caddy.CaddyfilePath, "write_caddyfile", "Write"),
 		setupCheck(trustReady, "trust", "Trusted Local HTTPS", trustDetail, "trust_caddy", "Trust"),
-		combinedLaunchdCheck(teelyLoginInstalled, caddyLoginInstalled, teelyPlist, caddyPlist),
+		singleLaunchdCheck(teelyLoginInstalled, teelyPlist),
 	}
 	return SetupState{Checks: checks}
 }
@@ -376,50 +418,18 @@ func launchdCheck(installed bool, id, label, detail, installAction, installLabel
 	return check
 }
 
-func combinedLaunchdCheck(teelyInstalled, caddyInstalled bool, teelyPlist, caddyPlist string) SetupCheck {
-	detail := fmt.Sprintf(
-		"Teely agent: %s (%s) • Caddy agent: %s (%s)",
-		loginStatusText(teelyInstalled),
-		teelyPlist,
-		loginStatusText(caddyInstalled),
-		caddyPlist,
+func singleLaunchdCheck(installed bool, teelyPlist string) SetupCheck {
+	detail := fmt.Sprintf("Teely launch agent: %s (%s)", loginStatusText(installed), teelyPlist)
+	return launchdCheck(
+		installed,
+		"login_bundle",
+		"Run Teely At Login",
+		detail,
+		"install_login_bundle",
+		"Enable",
+		"uninstall_login_bundle",
+		"Disable",
 	)
-
-	switch {
-	case teelyInstalled && caddyInstalled:
-		return SetupCheck{
-			ID:          "login_bundle",
-			Label:       "Run Teely At Login",
-			Detail:      detail,
-			Installed:   true,
-			StatusLabel: "Enabled",
-			StatusClass: "running",
-			Action:      "uninstall_login_bundle",
-			ActionLabel: "Disable",
-		}
-	case teelyInstalled || caddyInstalled:
-		return SetupCheck{
-			ID:          "login_bundle",
-			Label:       "Run Teely At Login",
-			Detail:      detail,
-			Installed:   false,
-			StatusLabel: "Partial",
-			StatusClass: "starting",
-			Action:      "install_login_bundle",
-			ActionLabel: "Repair",
-		}
-	default:
-		return SetupCheck{
-			ID:          "login_bundle",
-			Label:       "Run Teely At Login",
-			Detail:      detail,
-			Installed:   false,
-			StatusLabel: "Missing",
-			StatusClass: "stopped",
-			Action:      "install_login_bundle",
-			ActionLabel: "Enable",
-		}
-	}
 }
 
 func loginStatusText(installed bool) string {
@@ -436,51 +446,14 @@ func (m *Manager) RunSetupAction(action string) (string, error) {
 	case "write_caddyfile":
 		return m.runProjectScript("write-caddyfile.sh", m.configPath)
 	case "install_login_bundle":
-		return m.runCombinedSetupActions(
-			setupStep{script: "install-launchd.sh", args: []string{m.configPath}},
-			setupStep{script: "install-caddy-launchd.sh", args: []string{m.configPath}},
-		)
-	case "uninstall_login_bundle":
-		return m.runCombinedSetupActions(
-			setupStep{script: "uninstall-launchd.sh"},
-			setupStep{script: "uninstall-caddy-launchd.sh"},
-		)
-	case "install_teely_launchd":
 		return m.runProjectScript("install-launchd.sh", m.configPath)
-	case "uninstall_teely_launchd":
+	case "uninstall_login_bundle":
 		return m.runProjectScript("uninstall-launchd.sh")
-	case "install_caddy_launchd":
-		return m.runProjectScript("install-caddy-launchd.sh", m.configPath)
-	case "uninstall_caddy_launchd":
-		return m.runProjectScript("uninstall-caddy-launchd.sh")
 	case "trust_caddy":
 		return m.runTrustCommand()
 	default:
 		return "", fmt.Errorf("unknown setup action %q", action)
 	}
-}
-
-type setupStep struct {
-	script string
-	args   []string
-}
-
-func (m *Manager) runCombinedSetupActions(steps ...setupStep) (string, error) {
-	outputs := make([]string, 0, len(steps))
-	for _, step := range steps {
-		output, err := m.runProjectScript(step.script, step.args...)
-		trimmed := strings.TrimSpace(output)
-		if trimmed != "" {
-			outputs = append(outputs, trimmed)
-		}
-		if err != nil {
-			if trimmed == "" {
-				return strings.Join(outputs, "\n\n"), err
-			}
-			return strings.Join(outputs, "\n\n"), err
-		}
-	}
-	return strings.Join(outputs, "\n\n"), nil
 }
 
 func (m *Manager) runProjectScript(name string, args ...string) (string, error) {
@@ -533,13 +506,6 @@ func teelyLaunchdLabel() string {
 		return label
 	}
 	return "com.marksowell.teely"
-}
-
-func teelyCaddyLaunchdLabel() string {
-	if label := strings.TrimSpace(os.Getenv("TEELY_CADDY_LAUNCHD_LABEL")); label != "" {
-		return label
-	}
-	return "com.marksowell.teely.caddy"
 }
 
 func fileExists(path string) bool {
@@ -602,19 +568,89 @@ func shellQuote(value string) string {
 }
 
 func (m *Manager) CaddySnippet() string {
-	cfg := m.Config()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.caddySnippetLocked()
+}
+
+func (m *Manager) syncCaddyLocked() error {
+	if m.config == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(m.config.Caddy.CaddyfilePath), 0o755); err != nil {
+		return fmt.Errorf("prepare caddyfile directory: %w", err)
+	}
+	if err := os.WriteFile(m.config.Caddy.CaddyfilePath, []byte(m.caddySnippetLocked()), 0o644); err != nil {
+		return fmt.Errorf("write caddyfile: %w", err)
+	}
+	if _, err := os.Stat(m.config.Caddy.BinaryPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("check caddy binary: %w", err)
+	}
+	cmd := exec.Command(m.config.Caddy.BinaryPath, "reload", "--config", m.config.Caddy.CaddyfilePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed == "" {
+			return fmt.Errorf("reload caddy: %w", err)
+		}
+		return fmt.Errorf("reload caddy: %s", trimmed)
+	}
+	return nil
+}
+
+func (m *Manager) commitConfigLocked(next *Config) error {
+	previous := cloneConfig(m.config)
+	if err := SaveConfig(m.configPath, next); err != nil {
+		return err
+	}
+
+	m.config = next
+	m.rebuildFromConfigLocked()
+	if err := m.syncCaddyLocked(); err != nil {
+		m.config = previous
+		m.rebuildFromConfigLocked()
+
+		restoreErr := SaveConfig(m.configPath, previous)
+		resyncErr := m.syncCaddyLocked()
+		switch {
+		case restoreErr != nil && resyncErr != nil:
+			return fmt.Errorf("%w (restore config: %v; restore caddy: %v)", err, restoreErr, resyncErr)
+		case restoreErr != nil:
+			return fmt.Errorf("%w (restore config: %v)", err, restoreErr)
+		case resyncErr != nil:
+			return fmt.Errorf("%w (restore caddy: %v)", err, resyncErr)
+		default:
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) caddySnippetLocked() string {
+	cfg := m.config
 	var b strings.Builder
 	b.WriteString("{\n")
 	b.WriteString("\tlocal_certs\n")
 	b.WriteString("\tskip_install_trust\n")
 	b.WriteString("}\n\n")
-	fmt.Fprintf(&b, "%s {\n", cfg.AdminHostname)
-	b.WriteString("\tbind 0.0.0.0 ::\n")
-	fmt.Fprintf(&b, "\treverse_proxy %s\n", cfg.ListenAddress)
-	b.WriteString("}\n\n")
+	sharedHosts := combinedLocalhostHosts(cfg)
+	if len(sharedHosts) > 0 {
+		fmt.Fprintf(&b, "%s {\n", strings.Join(sharedHosts, ", "))
+		b.WriteString("\tbind 0.0.0.0 ::\n")
+		b.WriteString("\ttls internal\n")
+		fmt.Fprintf(&b, "\treverse_proxy %s\n", cfg.ListenAddress)
+		b.WriteString("}\n\n")
+	}
 	for _, app := range cfg.Apps {
+		if shouldUseSharedLocalhostRoute(app, cfg.ListenAddress) {
+			continue
+		}
 		fmt.Fprintf(&b, "%s {\n", app.Hostname)
 		b.WriteString("\tbind 0.0.0.0 ::\n")
+		b.WriteString("\ttls internal\n")
 		if strings.TrimSpace(app.CaddyDirectives) != "" {
 			for _, line := range strings.Split(app.CaddyDirectives, "\n") {
 				trimmed := strings.TrimRight(line, " \t")
@@ -632,6 +668,62 @@ func (m *Manager) CaddySnippet() string {
 		b.WriteString("}\n\n")
 	}
 	return b.String()
+}
+
+func combinedLocalhostHosts(cfg *Config) []string {
+	seen := map[string]bool{}
+	var hosts []string
+	adminHost := strings.ToLower(strings.TrimSpace(cfg.AdminHostname))
+	if strings.HasSuffix(adminHost, ".localhost") {
+		hosts = append(hosts, cfg.AdminHostname)
+		seen[adminHost] = true
+	}
+	for _, app := range cfg.Apps {
+		if !shouldUseSharedLocalhostRoute(app, cfg.ListenAddress) {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(app.Hostname))
+		if host == "" || seen[host] {
+			continue
+		}
+		hosts = append(hosts, app.Hostname)
+		seen[host] = true
+	}
+	return hosts
+}
+
+func shouldUseSharedLocalhostRoute(app AppConfig, listenAddress string) bool {
+	hostname := strings.ToLower(strings.TrimSpace(app.Hostname))
+	if !strings.HasSuffix(hostname, ".localhost") {
+		return false
+	}
+	directives := strings.TrimSpace(app.CaddyDirectives)
+	if directives == "" {
+		return true
+	}
+	return directives == defaultCaddyDirectives(listenAddress)
+}
+
+func removeLocalCaddyCertCache(hostname string) error {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	candidates := []string{
+		filepath.Join(home, "Library", "Application Support", "Caddy", "certificates", "local", hostname),
+		filepath.Join(home, ".local", "share", "caddy", "certificates", "local", hostname),
+	}
+	var firstErr error
+	for _, path := range candidates {
+		if err := os.RemoveAll(path); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (m *Manager) rebuildFromConfigLocked() {
@@ -708,6 +800,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 		rt.status = StatusRunning
 		rt.ready = true
 		rt.adopted = true
+		rt.managedPID = 0
 		rt.lastError = ""
 		rt.exitCode = nil
 		now := time.Now()
@@ -723,6 +816,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 		rt.status = StatusError
 		rt.ready = false
 		rt.adopted = false
+		rt.managedPID = 0
 		rt.lastError = err.Error()
 		rt.exitCode = nil
 		now := time.Now()
@@ -737,6 +831,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 
 	rt.status = StatusStarting
 	rt.adopted = false
+	rt.managedPID = 0
 	rt.ready = false
 	rt.lastError = ""
 	rt.exitCode = nil
@@ -785,6 +880,7 @@ func (rt *appRuntime) watchProcess() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	intentionalStop := rt.stopping
 	exitCode := 0
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -797,19 +893,29 @@ func (rt *appRuntime) watchProcess() {
 		} else {
 			exitCode = 1
 		}
-		rt.lastError = err.Error()
+		if !intentionalStop {
+			rt.lastError = err.Error()
+		}
 	}
 	rt.exitCode = &exitCode
 	rt.cmd = nil
-	rt.adopted = false
+	if rt.managedPID == 0 {
+		rt.adopted = false
+	}
 	if rt.status == StatusStarting || rt.status == StatusRunning {
-		if rt.ready {
+		if intentionalStop {
+			rt.status = StatusStopped
+		} else if rt.ready {
 			rt.status = StatusStopped
 		} else {
 			rt.status = StatusError
 		}
 	}
 	rt.ready = false
+	if intentionalStop {
+		rt.lastError = ""
+	}
+	rt.stopping = false
 	log.Printf("app %s process exited with code %d; status=%s error=%q", rt.cfg.ID, exitCode, rt.status, rt.lastError)
 }
 
@@ -823,6 +929,9 @@ func (rt *appRuntime) waitUntilReady(client *http.Client) {
 			if rt.status == StatusStarting {
 				rt.status = StatusRunning
 				rt.ready = true
+				if conflict := detectPortConflict(rt.cfg.Port); conflict != nil {
+					rt.managedPID = conflict.PID
+				}
 			}
 			rt.mu.Unlock()
 			log.Printf("app %s became ready on port %d", rt.cfg.ID, rt.cfg.Port)
@@ -853,6 +962,9 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 			rt.portConflict = conflict
 			rt.status = StatusRunning
 			rt.ready = true
+			if conflict != nil && rt.managedPID == 0 {
+				rt.managedPID = conflict.PID
+			}
 			rt.lastError = ""
 			rt.mu.Unlock()
 			return
@@ -870,7 +982,7 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 		if rt.cmd == nil && rt.status != StatusRunning {
 			rt.status = StatusRunning
 			rt.ready = true
-			rt.adopted = true
+			rt.adopted = !(conflict != nil && rt.managedPID != 0 && conflict.PID == rt.managedPID)
 			if rt.lastUsedAt == nil {
 				now := time.Now()
 				rt.lastUsedAt = &now
@@ -880,6 +992,9 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 				rt.startedAt = &now
 			}
 			rt.lastError = ""
+		}
+		if conflict != nil && rt.managedPID == 0 && !rt.adopted {
+			rt.managedPID = conflict.PID
 		}
 		rt.mu.Unlock()
 		return
@@ -891,6 +1006,7 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 		rt.status = StatusStopped
 		rt.ready = false
 		rt.adopted = false
+		rt.managedPID = 0
 	}
 	if rt.cmd == nil && rt.status == StatusRunning && !rt.ready {
 		rt.status = StatusStopped
@@ -1038,14 +1154,40 @@ func (rt *appRuntime) stop(reason string) error {
 		return errAlreadyStopped
 	}
 	if rt.cmd == nil || rt.cmd.Process == nil {
+		if rt.managedPID != 0 {
+			managedPID := rt.managedPID
+			rt.stopping = true
+			rt.logs.Write([]byte("\n[teely] " + reason + "\n"))
+			log.Printf("stopping app %s via tracked listener pid %d: %s", rt.cfg.ID, managedPID, reason)
+			rt.mu.Unlock()
+
+			stopManagedListener(managedPID, rt.cfg.Port)
+
+			rt.mu.Lock()
+			rt.status = StatusStopped
+			rt.ready = false
+			rt.managedPID = 0
+			rt.stopping = false
+			rt.lastError = ""
+			rt.mu.Unlock()
+			return nil
+		}
 		rt.status = StatusStopped
 		rt.ready = false
+		rt.managedPID = 0
+		rt.stopping = false
 		rt.lastError = ""
 		rt.mu.Unlock()
 		return errAlreadyStopped
 	}
 	cmd := rt.cmd
 	cancel := rt.cancel
+	managedPID := rt.managedPID
+	cmdPID := 0
+	if cmd.Process != nil {
+		cmdPID = cmd.Process.Pid
+	}
+	rt.stopping = true
 	rt.logs.Write([]byte("\n[teely] " + reason + "\n"))
 	log.Printf("stopping app %s: %s", rt.cfg.ID, reason)
 	rt.mu.Unlock()
@@ -1054,11 +1196,26 @@ func (rt *appRuntime) stop(reason string) error {
 		cancel()
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if managedPID != 0 && managedPID != cmdPID {
+		log.Printf("also stopping tracked listener pid %d for app %s", managedPID, rt.cfg.ID)
+		stopManagedListener(managedPID, rt.cfg.Port)
+	}
 
 	select {
 	case <-rt.waitDone:
 	case <-time.After(5 * time.Second):
 		_ = cmd.Process.Kill()
+		if managedPID != 0 && managedPID != cmdPID {
+			forceKillProcess(managedPID)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !probeTCP(rt.cfg.Port) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	rt.mu.Lock()
@@ -1066,6 +1223,8 @@ func (rt *appRuntime) stop(reason string) error {
 	rt.ready = false
 	rt.cmd = nil
 	rt.cancel = nil
+	rt.managedPID = 0
+	rt.stopping = false
 	rt.lastError = ""
 	rt.mu.Unlock()
 	return nil
@@ -1088,6 +1247,9 @@ func (rt *appRuntime) snapshot() AppState {
 		if state.PortConflict != nil && state.PortConflict.PID == state.PID {
 			state.PortConflict.ManagedByTeely = true
 		}
+	}
+	if state.PortConflict != nil && rt.managedPID != 0 && state.PortConflict.PID == rt.managedPID {
+		state.PortConflict.ManagedByTeely = true
 	}
 	if rt.startedAt != nil {
 		t := *rt.startedAt
@@ -1143,6 +1305,35 @@ func detectPortConflict(port int) *PortConflict {
 		conflict.Command = "unknown"
 	}
 	return &conflict
+}
+
+func stopManagedListener(pid int, port int) {
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		_ = process.Signal(syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !probeTCP(port) {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	forceKillProcess(pid)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !probeTCP(port) {
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+func forceKillProcess(pid int) {
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		_ = process.Signal(syscall.SIGKILL)
+	}
 }
 
 func normalizeNewApp(configPath string, app AppConfig) (AppConfig, error) {

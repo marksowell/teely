@@ -326,7 +326,7 @@ func sampleConfigBytes(configPath string) ([]byte, error) {
 				Port:           3000,
 				HealthPath:     "/",
 				HealthMethod:   "GET",
-				IdleTimeout:    "20m",
+				IdleTimeout:    "10m",
 				StartupTimeout: "90s",
 			},
 		},
