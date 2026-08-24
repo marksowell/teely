@@ -28,7 +28,6 @@ go install github.com/marksowell/teely/cmd/teely@latest
 
 ```bash
 teely init
-# edit the generated config
 teely up
 teely trust
 ```
@@ -36,6 +35,27 @@ teely trust
 Then open:
 
 - [https://teely.localhost](https://teely.localhost)
+
+From the dashboard you can:
+
+- add and edit apps
+- finish machine setup
+- configure AI import
+- save AI keys into macOS Keychain
+
+## AI Setup
+
+Teely can draft an app registration from a project folder with **Add App with AI**.
+
+Open **Setup** in the dashboard and save:
+
+- one provider
+- one model
+- one API key
+
+Teely stores the provider and model in its config and stores the API key separately in macOS Keychain.
+
+Once AI import is configured, **Add App with AI** appears in the dashboard.
 
 ## What Teely Does
 
@@ -71,9 +91,9 @@ teely down
 ## Add Your Apps
 
 1. Run `teely init`
-2. Put in your real app paths, commands, hostnames, and ports
-3. Start Teely with `teely up`
-4. Open `https://teely.localhost` to manage apps
+2. Start Teely with `teely up`
+3. Open `https://teely.localhost`
+4. Add apps from the dashboard
 
 ## Troubleshooting
 

@@ -49,8 +49,11 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/":
 		apps := m.ListApps()
 		cfg := m.Config()
+		setup := m.SetupState()
 		var editing *AppState
 		var deleting *AppState
+		showImport := strings.TrimSpace(r.URL.Query().Get("import")) != ""
+		showAIDetails := strings.TrimSpace(r.URL.Query().Get("ai")) != ""
 		showCreate := len(apps) == 0 || strings.TrimSpace(r.URL.Query().Get("add")) != ""
 		if editID := strings.TrimSpace(r.URL.Query().Get("edit")); editID != "" {
 			if app, ok := m.GetAppByID(editID); ok {
@@ -65,8 +68,10 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 				editing = nil
 			}
 		}
+		aiEnabled := setup.AI.Enabled
+		aiConfigError := strings.TrimSpace(setup.AI.ConfigError)
 		formState := newDraftAppState(cfg)
-		showModal := showCreate || editing != nil || deleting != nil
+		showModal := showCreate || (showImport && (aiEnabled || aiConfigError != "")) || editing != nil || deleting != nil
 		isEditing := editing != nil
 		if editing != nil {
 			formState = *editing
@@ -80,13 +85,18 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			CaddySnippet:    m.CaddySnippet(),
 			Editing:         editing,
 			Deleting:        deleting,
-			Setup:           m.SetupState(),
+			Setup:           setup,
 			Notice:          strings.TrimSpace(r.URL.Query().Get("notice")),
 			ErrorMessage:    strings.TrimSpace(r.URL.Query().Get("error")),
 			ShowModal:       showModal,
 			IsEditing:       isEditing,
+			Importing:       showImport,
 			FormState:       formState,
 			NeedsOnboarding: len(apps) == 0,
+			AIEnabled:       aiEnabled,
+			AIProviders:     supportedAIProviders(),
+			AIConfigError:   aiConfigError,
+			ShowAIDetails:   showAIDetails,
 			RunningCount:    statusCount(apps, StatusRunning),
 			StartingCount:   statusCount(apps, StatusStarting),
 			ErrorCount:      statusCount(apps, StatusError),
@@ -112,6 +122,18 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.Method == http.MethodPost && r.URL.Path == "/__teely/register":
 		m.handleRegister(w, r)
+		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/import":
+		m.handleImport(w, r)
+		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/save":
+		m.handleAISave(w, r)
+		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/fetch-models":
+		m.handleAIFetchModels(w, r)
+		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/delete-key":
+		m.handleAIDeleteKey(w, r)
 		return
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/__teely/setup/"):
 		m.handleSetupAction(w, r)
@@ -248,6 +270,149 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+func (m *Manager) handleImport(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	apps := m.ListApps()
+	cfg := m.Config()
+	setup := m.SetupState()
+	aiEnabled := setup.AI.Enabled
+	aiConfigError := strings.TrimSpace(setup.AI.ConfigError)
+	draft, err := m.DraftAppFromProject(r.Context(), r.FormValue("project_path"))
+	if err != nil {
+		renderDashboard(w, dashboardView{
+			Config:        cfg,
+			Apps:          apps,
+			CaddySnippet:  m.CaddySnippet(),
+			Setup:         setup,
+			ShowModal:     true,
+			Importing:     true,
+			ImportPath:    strings.TrimSpace(r.FormValue("project_path")),
+			ImportError:   err.Error(),
+			AIEnabled:     aiEnabled,
+			AIProviders:   supportedAIProviders(),
+			AIConfigError: aiConfigError,
+			RunningCount:  statusCount(apps, StatusRunning),
+			StartingCount: statusCount(apps, StatusStarting),
+			ErrorCount:    statusCount(apps, StatusError),
+		})
+		return
+	}
+	renderDashboard(w, dashboardView{
+		Config:        cfg,
+		Apps:          apps,
+		CaddySnippet:  m.CaddySnippet(),
+		Setup:         setup,
+		ShowModal:     true,
+		FormState:     AppState{Config: draft.App},
+		AIEnabled:     aiEnabled,
+		AIProviders:   supportedAIProviders(),
+		ImportNotice:  draft.Message,
+		ImportPath:    draft.Path,
+		RunningCount:  statusCount(apps, StatusRunning),
+		StartingCount: statusCount(apps, StatusStarting),
+		ErrorCount:    statusCount(apps, StatusError),
+	})
+}
+
+func (m *Manager) handleAISave(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	provider := strings.TrimSpace(r.FormValue("provider"))
+	model := strings.TrimSpace(r.FormValue("model"))
+	if provider == "" {
+		http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape("Select a provider before saving AI configuration."), http.StatusSeeOther)
+		return
+	}
+	if model == "" {
+		http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape("Select or enter a model before saving AI configuration."), http.StatusSeeOther)
+		return
+	}
+	if err := m.UpdateAIConfig(AIConfig{Provider: provider, Model: model}); err != nil {
+		http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	if key := strings.TrimSpace(r.FormValue("api_key")); key != "" {
+		if err := saveAIKey(provider, key); err != nil {
+			http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape(err.Error()), http.StatusSeeOther)
+			return
+		}
+	}
+	http.Redirect(w, r, "/?notice="+urlpkg.QueryEscape("AI configuration saved."), http.StatusSeeOther)
+}
+
+func (m *Manager) handleAIFetchModels(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	current := m.Config().AI
+	provider := strings.TrimSpace(r.FormValue("provider"))
+	if provider == "" {
+		provider = strings.TrimSpace(current.Provider)
+	}
+	if provider == "" {
+		m.setModelOptions("", nil, "Select a provider first.")
+		http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+		return
+	}
+	next := AIConfig{Provider: provider}
+	if strings.EqualFold(strings.TrimSpace(current.Provider), provider) {
+		next.Model = strings.TrimSpace(current.Model)
+	}
+	if err := m.UpdateAIConfig(next); err != nil {
+		m.setModelOptions(provider, nil, err.Error())
+		http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+		return
+	}
+	apiKey := strings.TrimSpace(r.FormValue("api_key"))
+	if apiKey != "" {
+		if err := saveAIKey(provider, apiKey); err != nil {
+			m.setModelOptions(provider, nil, err.Error())
+			http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+			return
+		}
+	}
+	keyToUse, _, ok, err := lookupAIKey(provider)
+	if err != nil {
+		m.setModelOptions(provider, nil, err.Error())
+		http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+		return
+	}
+	if !ok || strings.TrimSpace(keyToUse) == "" {
+		msg := "Enter an API key first."
+		m.setModelOptions(provider, nil, msg)
+		http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+		return
+	}
+	options, err := fetchModelOptions(r.Context(), provider, keyToUse)
+	if err != nil {
+		m.setModelOptions(provider, nil, err.Error())
+		http.Redirect(w, r, "/?ai=1#ai-configuration", http.StatusSeeOther)
+		return
+	}
+	m.setModelOptions(provider, options, "")
+	http.Redirect(w, r, "/?ai=1&ai_focus=model#ai-configuration", http.StatusSeeOther)
+}
+
+func (m *Manager) handleAIDeleteKey(w http.ResponseWriter, r *http.Request) {
+	cfg := m.Config()
+	provider := strings.TrimSpace(cfg.AI.Provider)
+	if provider == "" {
+		http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape("No AI provider is configured yet."), http.StatusSeeOther)
+		return
+	}
+	if err := deleteAIKey(provider); err != nil {
+		http.Redirect(w, r, "/?ai=1&error="+urlpkg.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/?ai=1&notice="+urlpkg.QueryEscape("AI key removed from Keychain."), http.StatusSeeOther)
+}
+
 func appRequiresRestart(before AppConfig, after AppConfig) bool {
 	return strings.TrimSpace(before.WorkingDir) != strings.TrimSpace(after.WorkingDir) ||
 		strings.TrimSpace(before.Command) != strings.TrimSpace(after.Command) ||
@@ -312,8 +477,16 @@ type dashboardView struct {
 	ErrorMessage    string
 	ShowModal       bool
 	IsEditing       bool
+	Importing       bool
 	FormState       AppState
 	NeedsOnboarding bool
+	AIEnabled       bool
+	AIConfigError   string
+	AIProviders     []AIProviderOption
+	ShowAIDetails   bool
+	ImportNotice    string
+	ImportError     string
+	ImportPath      string
 	RunningCount    int
 	StartingCount   int
 	ErrorCount      int
@@ -531,7 +704,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      gap: 12px;
       padding: 14px 24px;
       border-bottom: 1px solid var(--line);
       background: color-mix(in srgb, var(--bg) 78%, rgba(255,251,244,0.72) 22%);
@@ -639,6 +812,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       border-top-right-radius: var(--radius-lg);
     }
     .panel-head h2 { margin: 0; font-size: 16px; line-height: 1.2; }
+    .panel-actions { justify-content: flex-end; }
     .panel-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
     .stack { display: grid; gap: 10px; padding: 14px; }
     .summary-grid { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(300px, 0.9fr); gap: 16px; align-items: start; }
@@ -712,7 +886,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       padding: 11px 12px;
       overflow-wrap: anywhere;
     }
-    .actions, .setup-actions, .form-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .actions, .setup-actions, .form-actions, .panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .actions { grid-area: actions; }
     button, .button-link {
       appearance: none; border: 0; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px;
@@ -731,6 +905,33 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     button.secondary, .button-link.secondary {
       background: var(--panel-muted); color: var(--text); border: 1px solid var(--line); box-shadow: none;
     }
+    button.secondary:disabled, .button-link.secondary[aria-disabled="true"] {
+      background: color-mix(in srgb, var(--panel-muted) 92%, transparent);
+      color: color-mix(in srgb, var(--muted) 90%, white 10%);
+      border: 1px solid var(--line);
+      box-shadow: none;
+      cursor: not-allowed;
+      opacity: 0.9;
+    }
+    .button-link.ai-link, button.ai-link {
+      background: var(--green-soft);
+      color: var(--accent-strong);
+      border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+      box-shadow: none;
+    }
+    .button-link.ai-link:hover, button.ai-link:hover {
+      background: color-mix(in srgb, var(--green-soft) 72%, var(--panel-strong));
+    }
+    .button-link.ai-link svg, button.ai-link svg {
+      width: 13px;
+      height: 13px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex: 0 0 auto;
+    }
     button.danger, .button-link.danger {
       background: color-mix(in srgb, var(--red) 88%, #8e1f18 12%);
       color: white;
@@ -748,9 +949,13 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     .notice { line-height: 1.45; }
     .notice.error-banner { background: var(--red-soft); }
     .notice.danger-banner {
+      padding: 12px 14px;
+      border-radius: 10px;
       background: color-mix(in srgb, var(--red-soft) 78%, var(--panel-strong));
-      border: 1px solid color-mix(in srgb, var(--red) 18%, transparent);
-      color: color-mix(in srgb, var(--text) 80%, var(--red) 20%);
+      border: 1px solid color-mix(in srgb, var(--red) 20%, transparent);
+      color: color-mix(in srgb, var(--text) 82%, var(--red) 18%);
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
     }
     .danger-panel {
       display: grid;
@@ -807,10 +1012,11 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     }
     .setup-list { display: grid; gap: 10px; }
     .setup-item {
-      display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; align-items: start; padding: 14px;
+      display: grid; grid-template-columns: minmax(0,1fr) auto; column-gap: 14px; row-gap: 0; align-items: start; padding: 14px;
       border: 1px solid var(--line); border-radius: 10px; background: transparent;
     }
     .setup-item h3 { margin: 0 0 3px; font-size: 13px; }
+    .setup-main { min-width: 0; }
     .setup-item .subtle {
       max-width: 100%;
       overflow-wrap: anywhere;
@@ -818,7 +1024,9 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       padding-right: 8px;
     }
     details.setup-detail {
+      grid-column: 1 / -1;
       margin-top: 6px;
+      width: 100%;
     }
     details.setup-detail summary {
       list-style: none;
@@ -839,7 +1047,74 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
-    .setup-actions { justify-content: flex-end; flex-shrink: 0; }
+.setup-actions { justify-content: flex-end; flex-shrink: 0; }
+.setup-ai-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.setup-ai-title svg {
+  width: 14px;
+  height: 14px;
+  stroke: var(--accent-strong);
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: 0 0 auto;
+}
+.setup-ai-form {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+.setup-ai-form > label,
+.setup-ai-model-row > label {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+.setup-ai-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.setup-ai-note {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+.setup-ai-model {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+}
+.setup-ai-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+.setup-ai-select {
+  width: 100%;
+}
+.setup-ai-key {
+  width: 100%;
+}
+.setup-ai-detail-body {
+  display: grid;
+  gap: 10px;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  width: 100%;
+  white-space: normal;
+}
     .empty { padding: 32px 18px; text-align: center; }
     .modal-shell {
       position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px;
@@ -860,6 +1135,33 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       display: grid;
       gap: 16px;
       align-content: start;
+    }
+    .modal.modal-ai {
+      background: color-mix(in srgb, var(--green-soft) 28%, var(--panel-strong));
+    }
+    .modal-ai-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .modal-ai-title svg {
+      width: 15px;
+      height: 15px;
+      stroke: var(--accent-strong);
+      fill: none;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex: 0 0 auto;
+    }
+    .form-select {
+      width: 100%; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--panel-muted);
+      color: var(--text); padding: 10px 12px; font: inherit; font-size: 13px; outline: none;
+      appearance: none; -webkit-appearance: none;
+      background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+      background-position: calc(100% - 16px) calc(50% - 2px), calc(100% - 11px) calc(50% - 2px);
+      background-size: 5px 5px, 5px 5px;
+      background-repeat: no-repeat;
     }
     details.advanced-options {
       border: 1px solid var(--line);
@@ -926,7 +1228,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       color: var(--text); padding: 10px 12px; font: inherit; font-size: 13px; outline: none;
     }
     textarea { min-height: 180px; resize: vertical; font-family: var(--font-mono); line-height: 1.45; }
-    input:focus, textarea:focus {
+    input:focus, textarea:focus, .form-select:focus {
       border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
     }
@@ -984,6 +1286,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       .field-grid, .detail-grid { grid-template-columns: 1fr; }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .modal-shell { padding: 14px; }
+      .setup-ai-model-row { grid-template-columns: 1fr; align-items: stretch; }
     }
   </style>
 </head>
@@ -1026,7 +1329,15 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
             <div>
               <h2>Registered Apps</h2>
             </div>
-            <a class="button-link" href="/?add=1">Add App</a>
+            <div class="panel-actions">
+              <a class="button-link" href="/?add=1">Add App</a>
+              {{ if .AIEnabled }}
+              <a class="button-link secondary ai-link" href="/?import=1">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 9.5 5l3.5 1.5L9.5 8 8 11.5 6.5 8 3 6.5 6.5 5 8 1.5Z"></path><path d="M12.25 11.25 12.85 12.65 14.25 13.25 12.85 13.85 12.25 15.25 11.65 13.85 10.25 13.25 11.65 12.65 12.25 11.25Z"></path></svg>
+                Add App with AI
+              </a>
+              {{ end }}
+            </div>
           </div>
           <div class="stack">
             {{ if .Apps }}
@@ -1116,14 +1427,8 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
             <div class="setup-list">
               {{ range .Setup.Checks }}
               <div class="setup-item">
-                <div>
+                <div class="setup-main">
                   <h3>{{ .Label }}</h3>
-                  {{ if .Detail }}
-                  <details class="setup-detail">
-                    <summary>Details</summary>
-                    <div class="setup-detail-body">{{ .Detail }}</div>
-                  </details>
-                  {{ end }}
                 </div>
                 <div class="setup-actions">
                   <span class="status-pill {{ .StatusClass }}">{{ .StatusLabel }}</span>
@@ -1131,8 +1436,72 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
                   <form class="inline" method="post" action="/__teely/setup/{{ .Action }}"><button class="secondary">{{ .ActionLabel }}</button></form>
                   {{ end }}
                 </div>
+                {{ if .Detail }}
+                <details class="setup-detail">
+                  <summary>Details</summary>
+                  <div class="setup-detail-body">{{ .Detail }}</div>
+                </details>
+                {{ end }}
               </div>
               {{ end }}
+              <div class="setup-item" id="ai-configuration">
+                <div class="setup-main">
+                  <h3 class="setup-ai-title"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 9.5 5l3.5 1.5L9.5 8 8 11.5 6.5 8 3 6.5 6.5 5 8 1.5Z"></path><path d="M12.25 11.25 12.85 12.65 14.25 13.25 12.85 13.85 12.25 15.25 11.65 13.85 10.25 13.25 11.65 12.65 12.25 11.25Z"></path></svg>AI Configuration</h3>
+                </div>
+                <div class="setup-actions">
+                  <span class="status-pill {{ .Setup.AI.StatusClass }}">{{ .Setup.AI.StatusLabel }}</span>
+                  {{ if and .Setup.AI.KeyStored (ne .Setup.AI.KeySource "environment") }}
+                  <form class="inline" method="post" action="/__teely/ai/delete-key">
+                    <button type="submit" class="secondary">Remove</button>
+                  </form>
+                  {{ end }}
+                </div>
+                <details class="setup-detail" {{ if .ShowAIDetails }}open{{ end }}>
+                  <summary>Details</summary>
+                  <div class="setup-detail-body setup-ai-detail-body">
+                    {{ if .Setup.AI.ConfigError }}
+                    <div class="runtime-error">{{ .Setup.AI.ConfigError }}</div>
+                    {{ end }}
+                    <form class="setup-ai-form" method="post" action="/__teely/ai/save">
+                      <label>Provider
+                        <select class="form-select" name="provider">
+                          <option value="">Select provider</option>
+                          {{ range .AIProviders }}
+                          <option value="{{ .ID }}" {{ if eq $.Setup.AI.Provider .ID }}selected{{ end }}>{{ .Label }}</option>
+                          {{ end }}
+                        </select>
+                      </label>
+                      <label>API Key
+                        <input class="setup-ai-key" type="password" name="api_key" placeholder="{{ if .Setup.AI.KeyStored }}Saved in Keychain. Enter a new key to replace it.{{ else }}Paste the API key for the selected provider{{ end }}" autocomplete="off">
+                      </label>
+                      <div class="setup-ai-note">The provider and model live in Teely config, and the key is securely stored separately in macOS Keychain.</div>
+                      <div class="setup-ai-model">
+                        <div class="setup-ai-model-row">
+                          <label>Model
+                            {{ if .Setup.AI.ModelOptions }}
+                            <select class="form-select setup-ai-select" name="model" data-ai-model {{ if not .Setup.AI.KeyStored }}disabled{{ end }}>
+                              <option value="">Select model</option>
+                              {{ range .Setup.AI.ModelOptions }}
+                              <option value="{{ .ID }}" {{ if eq $.Setup.AI.Model .ID }}selected{{ end }}>{{ .ID }}</option>
+                              {{ end }}
+                            </select>
+                            {{ else }}
+                            <input name="model" value="{{ .Setup.AI.Model }}" data-ai-model {{ if not .Setup.AI.KeyStored }}disabled{{ end }}>
+                            {{ end }}
+                          </label>
+                          <button type="submit" formaction="/__teely/ai/fetch-models" class="secondary" data-fetch-models {{ if not .Setup.AI.KeyStored }}disabled aria-disabled="true"{{ end }}>Fetch Models</button>
+                        </div>
+                        {{ if .Setup.AI.ModelError }}
+                        <div class="runtime-error">{{ .Setup.AI.ModelError }}</div>
+                        {{ end }}
+                      </div>
+                      <div class="setup-ai-actions">
+                        <button type="submit">Save</button>
+                      </div>
+                    </form>
+                  </div>
+                </details>
+              </div>
             </div>
           </div>
         </aside>
@@ -1150,18 +1519,28 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
 
   {{ if .ShowModal }}
   <div class="modal-shell">
-    <div class="modal">
+    <div class="modal{{ if .Importing }} modal-ai{{ end }}">
       <div class="modal-head">
         <div>
-          <h2>{{ if .Deleting }}Delete App{{ else if .IsEditing }}Edit App{{ else if .NeedsOnboarding }}Register Your First App{{ else }}Add App{{ end }}</h2>
-          <p>{{ if .Deleting }}Remove this app from Teely after confirming the app ID.{{ else if .IsEditing }}Update the app, route, and custom Caddy directives in one place.{{ else if .NeedsOnboarding }}Teely starts here. Add one app and the dashboard will collapse down to status and controls after setup.{{ else }}Add a new local app with its startup command, hostname, and Caddy routing directives.{{ end }}</p>
+          <h2>{{ if .Deleting }}Delete App{{ else if .Importing }}<span class="modal-ai-title"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 9.5 5l3.5 1.5L9.5 8 8 11.5 6.5 8 3 6.5 6.5 5 8 1.5Z"></path><path d="M12.25 11.25 12.85 12.65 14.25 13.25 12.85 13.85 12.25 15.25 11.65 13.85 10.25 13.25 11.65 12.65 12.25 11.25Z"></path></svg>Add App with AI</span>{{ else if .IsEditing }}Edit App{{ else if .NeedsOnboarding }}Register Your First App{{ else }}Add App{{ end }}</h2>
+          <p>{{ if .Deleting }}Remove this app from Teely after confirming the app ID.{{ else if .Importing }}Choose a working project folder and Teely will inspect the app, README, and common project files to draft the registration form.{{ else if .IsEditing }}Update the app, route, and custom Caddy directives in one place.{{ else if .NeedsOnboarding }}Teely starts here. Add one app and the dashboard will collapse down to status and controls after setup.{{ else }}Add a new local app with its startup command, hostname, and Caddy routing directives.{{ end }}</p>
         </div>
         <div class="actions">
           {{ if not .NeedsOnboarding }}<a class="button-link secondary" href="/">Close</a>{{ end }}
         </div>
       </div>
       <div class="modal-body">
-        {{ if .Deleting }}
+        {{ if .Importing }}
+        <form class="modal-form" method="post" action="/__teely/import">
+          {{ if .AIConfigError }}<div class="notice danger-banner">{{ .AIConfigError }}</div>{{ end }}
+          {{ if .ImportError }}<div class="notice danger-banner">{{ .ImportError }}</div>{{ end }}
+          <label>Project Path<input name="project_path" placeholder="/absolute/path/to/your-app" value="{{ .ImportPath }}" required></label>
+          <div class="form-actions">
+            <button type="submit" class="ai-link" {{ if not .AIEnabled }}disabled aria-disabled="true"{{ end }}>Analyze Folder</button>
+            <a class="button-link secondary" href="/">Cancel</a>
+          </div>
+        </form>
+        {{ else if .Deleting }}
         <form class="modal-form" method="post" action="/__teely/apps/{{ .Deleting.Config.ID }}/delete">
           <div class="danger-panel">
             <span class="danger-kicker">Permanent Action</span>
@@ -1183,6 +1562,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           </div>
         </form>
         {{ else }}
+        {{ if .ImportNotice }}<div class="notice">{{ .ImportNotice }}</div>{{ end }}
         {{ if .IsEditing }}
         <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. Changing the hostname updates routing to the new URL after save.</div>
         {{ end }}
@@ -1451,6 +1831,45 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         });
         syncRestartState();
       });
+
+      document.querySelectorAll('form[action="/__teely/ai/save"]').forEach((form) => {
+        const provider = form.querySelector('[name="provider"]');
+        const apiKey = form.querySelector('[name="api_key"]');
+        const fetchButton = form.querySelector('[data-fetch-models]');
+        const modelField = form.querySelector('[data-ai-model]');
+        if (!provider || !apiKey || !fetchButton) {
+          return;
+        }
+        const syncFetchButton = () => {
+          const hasProvider = String(provider.value || "").trim() !== "";
+          const hasTypedKey = String(apiKey.value || "").trim() !== "";
+          const savedKeyPlaceholder = String(apiKey.getAttribute("placeholder") || "").toLowerCase().includes("saved in keychain");
+          const canFetch = hasProvider && (hasTypedKey || savedKeyPlaceholder);
+          fetchButton.disabled = !canFetch;
+          fetchButton.setAttribute("aria-disabled", fetchButton.disabled ? "true" : "false");
+          if (modelField) {
+            modelField.disabled = !canFetch;
+          }
+        };
+        provider.addEventListener("change", syncFetchButton);
+        apiKey.addEventListener("input", syncFetchButton);
+        syncFetchButton();
+      });
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("ai_focus") === "model") {
+        const modelField = document.querySelector('[data-ai-model]');
+        if (modelField && !modelField.disabled) {
+          requestAnimationFrame(() => {
+            modelField.focus({ preventScroll: true });
+            modelField.scrollIntoView({ block: "center", behavior: "instant" });
+            params.delete("ai_focus");
+            const next = params.toString();
+            const url = window.location.pathname + (next ? "?" + next : "") + window.location.hash;
+            window.history.replaceState({}, "", url);
+          });
+        }
+      }
     })();
   </script>
 </body>

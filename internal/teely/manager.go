@@ -65,16 +65,19 @@ type SetupCheck struct {
 
 type SetupState struct {
 	Checks []SetupCheck
+	AI     AISetupState
 }
 
 type Manager struct {
 	configPath string
 
-	mu         sync.RWMutex
-	config     *Config
-	runtimes   map[string]*appRuntime
-	hostToApp  map[string]string
-	httpClient *http.Client
+	mu             sync.RWMutex
+	config         *Config
+	runtimes       map[string]*appRuntime
+	hostToApp      map[string]string
+	httpClient     *http.Client
+	aiModelOptions map[string][]AIModelOption
+	aiModelErrors  map[string]string
 }
 
 type appRuntime struct {
@@ -105,11 +108,13 @@ func NewManager(configPath string) (*Manager, error) {
 	}
 
 	m := &Manager{
-		configPath: configPath,
-		config:     cfg,
-		runtimes:   map[string]*appRuntime{},
-		hostToApp:  map[string]string{},
-		httpClient: &http.Client{Timeout: 2 * time.Second},
+		configPath:     configPath,
+		config:         cfg,
+		runtimes:       map[string]*appRuntime{},
+		hostToApp:      map[string]string{},
+		httpClient:     &http.Client{Timeout: 2 * time.Second},
+		aiModelOptions: map[string][]AIModelOption{},
+		aiModelErrors:  map[string]string{},
 	}
 	m.rebuildFromConfigLocked()
 	go m.idleLoop()
@@ -342,6 +347,9 @@ func (m *Manager) UpsertApp(app AppConfig) error {
 		if existing.ID != normalized.ID && strings.EqualFold(existing.Hostname, normalized.Hostname) {
 			return fmt.Errorf("hostname %q is already used by %q", normalized.Hostname, existing.ID)
 		}
+		if existing.ID != normalized.ID && existing.Port == normalized.Port {
+			return duplicatePortError(normalized, existing)
+		}
 	}
 
 	found := false
@@ -383,7 +391,11 @@ func (m *Manager) SetupState() SetupState {
 		setupCheck(trustReady, "trust", "Trusted Local HTTPS", trustDetail, "trust_caddy", "Trust"),
 		singleLaunchdCheck(teelyLoginInstalled, teelyPlist),
 	}
-	return SetupState{Checks: checks}
+	ai := buildAISetupState(cfg)
+	if strings.TrimSpace(ai.Provider) != "" {
+		ai.ModelOptions, ai.ModelError = m.modelOptionsSnapshot(ai.Provider)
+	}
+	return SetupState{Checks: checks, AI: ai}
 }
 
 func setupCheck(installed bool, id, label, detail, action, actionLabel string) SetupCheck {

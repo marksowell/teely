@@ -16,7 +16,13 @@ type Config struct {
 	AdminHostname string      `json:"admin_hostname"`
 	RuntimeDir    string      `json:"runtime_dir"`
 	Caddy         CaddyConfig `json:"caddy"`
+	AI            AIConfig    `json:"ai,omitempty"`
 	Apps          []AppConfig `json:"apps"`
+}
+
+type AIConfig struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 type CaddyConfig struct {
@@ -72,8 +78,11 @@ func LoadConfig(path string) (*Config, error) {
 	} else if !filepath.IsAbs(cfg.Caddy.CaddyfilePath) {
 		cfg.Caddy.CaddyfilePath = filepath.Clean(filepath.Join(baseDir, cfg.Caddy.CaddyfilePath))
 	}
+	cfg.AI.Provider = strings.ToLower(strings.TrimSpace(cfg.AI.Provider))
+	cfg.AI.Model = strings.TrimSpace(cfg.AI.Model)
 	seenIDs := map[string]struct{}{}
 	seenHosts := map[string]struct{}{}
+	seenPorts := map[int]AppConfig{}
 	for i := range cfg.Apps {
 		app := &cfg.Apps[i]
 		if app.ID == "" {
@@ -124,8 +133,12 @@ func LoadConfig(path string) (*Config, error) {
 		if _, ok := seenHosts[strings.ToLower(app.Hostname)]; ok {
 			return nil, fmt.Errorf("duplicate hostname %q", app.Hostname)
 		}
+		if existing, ok := seenPorts[app.Port]; ok {
+			return nil, duplicatePortError(*app, existing)
+		}
 		seenIDs[app.ID] = struct{}{}
 		seenHosts[strings.ToLower(app.Hostname)] = struct{}{}
+		seenPorts[app.Port] = cloneAppConfig(*app)
 	}
 	slices.SortFunc(cfg.Apps, func(a, b AppConfig) int {
 		return strings.Compare(a.Name, b.Name)
@@ -148,6 +161,7 @@ func cloneConfig(cfg *Config) *Config {
 		return nil
 	}
 	cloned := *cfg
+	cloned.AI = cfg.AI
 	if cfg.Apps != nil {
 		cloned.Apps = make([]AppConfig, len(cfg.Apps))
 		for i, app := range cfg.Apps {
@@ -166,6 +180,14 @@ func cloneAppConfig(app AppConfig) AppConfig {
 		}
 	}
 	return cloned
+}
+
+func duplicatePortError(app AppConfig, existing AppConfig) error {
+	label := strings.TrimSpace(existing.Name)
+	if label == "" {
+		label = existing.ID
+	}
+	return fmt.Errorf("port %d is already assigned to %s (%s)", app.Port, label, existing.ID)
 }
 
 func appParsedIdleTimeout(app AppConfig) (time.Duration, error) {
