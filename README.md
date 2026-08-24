@@ -40,22 +40,10 @@ From the dashboard you can:
 
 - add and edit apps
 - finish machine setup
-- configure AI import
+- configure AI support for OpenAI, Anthropic, Google
 - save AI keys into macOS Keychain
 
-## AI Setup
-
-Teely can draft an app registration from a project folder with **Add App with AI**.
-
-Open **Setup** in the dashboard and save:
-
-- one provider
-- one model
-- one API key
-
-Teely stores the provider and model in its config and stores the API key separately in macOS Keychain.
-
-Once AI import is configured, **Add App with AI** appears in the dashboard.
+Once AI is configured, **Add App with AI** appears in the dashboard which can draft an app registration from a project folder.
 
 ## What Teely Does
 
@@ -67,6 +55,19 @@ Once AI import is configured, **Add App with AI** appears in the dashboard.
 - stops apps after idle timeout
 - works with local app commands directly instead of requiring containers
 - gives you a built-in dashboard for setup, status, logs, and controls
+
+## Roadmap
+
+### Targeted for `v0.3`
+
+- add a runtime mode per app:
+  - `host-fixed`
+  - `host-auto`
+  - `isolated`
+- add mode-aware validation:
+  - `host-fixed`: port must be unique across other `host-fixed` apps
+  - `host-auto`: no fixed-port collision check because Teely chooses one at runtime
+  - `isolated`: no host-port collision check because the app gets its own network context
 
 ## Related Projects
 
@@ -87,13 +88,6 @@ teely status
 teely restart
 teely down
 ```
-
-## Add Your Apps
-
-1. Run `teely init`
-2. Start Teely with `teely up`
-3. Open `https://teely.localhost`
-4. Add apps from the dashboard
 
 ## Troubleshooting
 

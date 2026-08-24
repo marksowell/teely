@@ -230,7 +230,20 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	port, err := strconv.Atoi(r.FormValue("port"))
 	if err != nil {
-		http.Error(w, "port must be a number", http.StatusBadRequest)
+		app := AppConfig{
+			ID:              strings.TrimSpace(r.FormValue("id")),
+			Name:            strings.TrimSpace(r.FormValue("name")),
+			Hostname:        strings.TrimSpace(r.FormValue("hostname")),
+			WorkingDir:      strings.TrimSpace(r.FormValue("working_dir")),
+			Command:         strings.TrimSpace(r.FormValue("command")),
+			HealthPath:      strings.TrimSpace(r.FormValue("health_path")),
+			HealthMethod:    strings.TrimSpace(r.FormValue("health_method")),
+			IdleTimeout:     strings.TrimSpace(r.FormValue("idle_timeout")),
+			StartupTimeout:  strings.TrimSpace(r.FormValue("startup_timeout")),
+			CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
+		}
+		_, exists := m.GetAppByID(app.ID)
+		m.renderRegisterFormError(w, app, "Port must be a number.", exists)
 		return
 	}
 	app := AppConfig{
@@ -254,7 +267,7 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 		needsRestart = appRequiresRestart(existing.Config, app)
 	}
 	if err := m.UpsertApp(app); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		m.renderRegisterFormError(w, app, err.Error(), exists)
 		return
 	}
 	if exists && wasActive && needsRestart {
@@ -487,6 +500,8 @@ type dashboardView struct {
 	ImportNotice    string
 	ImportError     string
 	ImportPath      string
+	FormError       string
+	PortError       string
 	RunningCount    int
 	StartingCount   int
 	ErrorCount      int
@@ -499,6 +514,33 @@ func restartRequiredForView(app AppState) bool {
 func renderDashboard(w http.ResponseWriter, view dashboardView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = dashboardTemplate.Execute(w, view)
+}
+
+func (m *Manager) renderRegisterFormError(w http.ResponseWriter, app AppConfig, formErr string, isEditing bool) {
+	apps := m.ListApps()
+	cfg := m.Config()
+	setup := m.SetupState()
+	portErr := ""
+	if strings.Contains(strings.ToLower(formErr), "port") {
+		portErr = formErr
+	}
+	renderDashboard(w, dashboardView{
+		Config:          cfg,
+		Apps:            apps,
+		CaddySnippet:    m.CaddySnippet(),
+		Setup:           setup,
+		ShowModal:       true,
+		IsEditing:       isEditing,
+		FormState:       AppState{Config: app},
+		NeedsOnboarding: len(apps) == 0,
+		AIEnabled:       setup.AI.Enabled,
+		AIProviders:     supportedAIProviders(),
+		FormError:       formErr,
+		PortError:       portErr,
+		RunningCount:    statusCount(apps, StatusRunning),
+		StartingCount:   statusCount(apps, StatusStarting),
+		ErrorCount:      statusCount(apps, StatusError),
+	})
 }
 
 func renderStartupPage(w http.ResponseWriter, state AppState) {
@@ -878,6 +920,12 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       line-height: 1.45;
       overflow-wrap: anywhere;
     }
+    .field-error {
+      color: var(--red);
+      font-size: 11px;
+      line-height: 1.4;
+      margin-top: 6px;
+    }
     .app-conflict {
       grid-area: conflict;
       border: 1px solid var(--line);
@@ -887,11 +935,21 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       overflow-wrap: anywhere;
     }
     .actions, .setup-actions, .form-actions, .panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .panel-actions {
+      justify-content: flex-end;
+    }
+    .panel-actions > .button-link,
+    .panel-actions > button {
+      min-width: 172px;
+      justify-content: center;
+      text-align: center;
+    }
     .actions { grid-area: actions; }
     button, .button-link {
       appearance: none; border: 0; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px;
       font-weight: 700; line-height: 1; cursor: pointer; text-decoration: none; background: var(--accent);
       color: white; box-shadow: inset 0 1px 0 rgba(255,255,255,0.14);
+      display: inline-flex; align-items: center;
     }
     button:hover, .button-link:hover { background: var(--accent-strong); text-decoration: none; }
     button:disabled {
@@ -1232,6 +1290,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
     }
+    input.input-error, textarea.input-error, .form-select.input-error {
+      border-color: color-mix(in srgb, var(--red) 38%, var(--line));
+      background: color-mix(in srgb, var(--red-soft) 34%, var(--panel-muted));
+    }
+    input.input-error:focus, textarea.input-error:focus, .form-select.input-error:focus {
+      border-color: color-mix(in srgb, var(--red) 52%, var(--line));
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 14%, transparent);
+    }
     input[readonly] { opacity: 0.72; }
     .code-note { line-height: 1.5; }
     pre {
@@ -1567,13 +1633,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. Changing the hostname updates routing to the new URL after save.</div>
         {{ end }}
         <form class="modal-form" method="post" action="/__teely/register" {{ if .IsEditing }}data-original-app='{{ toJSON .FormState.Config }}' data-app-active="{{ if restartRequiredForView .FormState }}true{{ else }}false{{ end }}"{{ end }}>
+          {{ if .FormError }}<div class="notice danger-banner">{{ .FormError }}</div>{{ end }}
           <div class="field-grid">
             <label>ID<input name="id" placeholder="sample-app" value="{{ .FormState.Config.ID }}" {{ if .IsEditing }}readonly{{ end }} required></label>
             <label>Name<input name="name" placeholder="Sample App" value="{{ .FormState.Config.Name }}"></label>
           </div>
           <div class="field-grid">
             <label>Hostname<input name="hostname" placeholder="sample-app.localhost" value="{{ .FormState.Config.Hostname }}" required></label>
-            <label>Port<input name="port" placeholder="3000" value="{{ .FormState.Config.Port }}" required></label>
+            <label>Port<input name="port" placeholder="3000" value="{{ .FormState.Config.Port }}" class="{{ if .PortError }}input-error{{ end }}" required></label>
           </div>
           <label>Working Directory<input name="working_dir" placeholder="/absolute/path/to/your-app" value="{{ .FormState.Config.WorkingDir }}" required></label>
           <label>Command<input name="command" placeholder="./start.sh" value="{{ .FormState.Config.Command }}" required></label>
