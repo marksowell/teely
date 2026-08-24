@@ -1465,7 +1465,8 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; background:linear-gradient(180deg,#f8f5ee,#efe7d8); color:#1f2e28; font-family: ui-rounded, "SF Pro Text", sans-serif; }
     .card { width:min(560px, calc(100vw - 32px)); padding:32px; background:rgba(255,255,255,0.75); border:1px solid rgba(73,87,72,0.12); border-radius:24px; box-shadow:0 20px 50px rgba(31,46,40,0.08); }
-    .pulse { width:12px; height:12px; border-radius:999px; background:#5b8a67; box-shadow:0 0 0 0 rgba(91,138,103,.6); animation:pulse 1.5s infinite; display:inline-block; margin-right:10px; }
+    h1 { display:flex; align-items:center; gap:10px; margin:0 0 18px; line-height:1; }
+    .pulse { width:12px; height:12px; border-radius:999px; background:#5b8a67; box-shadow:0 0 0 0 rgba(91,138,103,.6); animation:pulse 1.5s infinite; display:block; flex:0 0 auto; }
     @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(91,138,103,.6);} 70% { box-shadow:0 0 0 14px rgba(91,138,103,0);} 100% { box-shadow:0 0 0 0 rgba(91,138,103,0);} }
     code { font-family: ui-monospace, SFMono-Regular, monospace; background:#f2eee4; padding:2px 6px; border-radius:6px; }
     p { color:#59655d; }
