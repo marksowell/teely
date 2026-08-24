@@ -70,6 +70,9 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		isEditing := editing != nil
 		if editing != nil {
 			formState = *editing
+			if strings.TrimSpace(formState.Config.CaddyDirectives) == "" {
+				formState.Config.CaddyDirectives = defaultCaddyDirectives(cfg.ListenAddress)
+			}
 		}
 		renderDashboard(w, dashboardView{
 			Config:          cfg,
