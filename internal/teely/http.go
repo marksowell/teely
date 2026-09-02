@@ -938,12 +938,6 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     .panel-actions {
       justify-content: flex-end;
     }
-    .panel-actions > .button-link,
-    .panel-actions > button {
-      min-width: 172px;
-      justify-content: center;
-      text-align: center;
-    }
     .actions { grid-area: actions; }
     button, .button-link {
       appearance: none; border: 0; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px;
