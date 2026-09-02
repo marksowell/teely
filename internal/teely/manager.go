@@ -647,12 +647,17 @@ func (m *Manager) caddySnippetLocked() string {
 	b.WriteString("{\n")
 	b.WriteString("\tlocal_certs\n")
 	b.WriteString("\tskip_install_trust\n")
+	b.WriteString("\tpki {\n")
+	b.WriteString("\t\tca local {\n")
+	b.WriteString("\t\t\tintermediate_lifetime 180d\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
 	sharedHosts := combinedLocalhostHosts(cfg)
 	if len(sharedHosts) > 0 {
 		fmt.Fprintf(&b, "%s {\n", strings.Join(sharedHosts, ", "))
 		b.WriteString("\tbind 0.0.0.0 ::\n")
-		b.WriteString("\ttls internal\n")
+		writeTeelyTLS(&b)
 		fmt.Fprintf(&b, "\treverse_proxy %s\n", cfg.ListenAddress)
 		b.WriteString("}\n\n")
 	}
@@ -662,7 +667,7 @@ func (m *Manager) caddySnippetLocked() string {
 		}
 		fmt.Fprintf(&b, "%s {\n", app.Hostname)
 		b.WriteString("\tbind 0.0.0.0 ::\n")
-		b.WriteString("\ttls internal\n")
+		writeTeelyTLS(&b)
 		if strings.TrimSpace(app.CaddyDirectives) != "" {
 			for _, line := range strings.Split(app.CaddyDirectives, "\n") {
 				trimmed := strings.TrimRight(line, " \t")
@@ -680,6 +685,14 @@ func (m *Manager) caddySnippetLocked() string {
 		b.WriteString("}\n\n")
 	}
 	return b.String()
+}
+
+func writeTeelyTLS(b *strings.Builder) {
+	b.WriteString("\ttls {\n")
+	b.WriteString("\t\tissuer internal {\n")
+	b.WriteString("\t\t\tlifetime 30d\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
 }
 
 func combinedLocalhostHosts(cfg *Config) []string {
