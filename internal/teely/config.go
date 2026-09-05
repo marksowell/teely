@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -61,6 +63,10 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.AdminHostname == "" {
 		cfg.AdminHostname = "teely.localhost"
 	}
+	listenPort, err := configuredListenPort(cfg.ListenAddress)
+	if err != nil {
+		return nil, err
+	}
 
 	baseDir := filepath.Dir(path)
 	if cfg.RuntimeDir == "" {
@@ -105,6 +111,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if app.Port <= 0 {
 			return nil, fmt.Errorf("app %q: port must be greater than 0", app.ID)
+		}
+		if listenPort > 0 && app.Port == listenPort {
+			return nil, teelyListenPortError(app.Port)
 		}
 		if app.HealthPath == "" {
 			app.HealthPath = "/"
@@ -188,6 +197,22 @@ func duplicatePortError(app AppConfig, existing AppConfig) error {
 		label = existing.ID
 	}
 	return fmt.Errorf("port %d is already assigned to %s (%s)", app.Port, label, existing.ID)
+}
+
+func configuredListenPort(address string) (int, error) {
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, fmt.Errorf("listen_address %q must include a host and port", address)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 {
+		return 0, fmt.Errorf("listen_address %q has an invalid port", address)
+	}
+	return port, nil
+}
+
+func teelyListenPortError(port int) error {
+	return fmt.Errorf("port %d is reserved by Teely's listen_address", port)
 }
 
 func appParsedIdleTimeout(app AppConfig) (time.Duration, error) {

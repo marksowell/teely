@@ -339,6 +339,13 @@ func (m *Manager) UpsertApp(app AppConfig) error {
 	if err != nil {
 		return err
 	}
+	listenPort, err := configuredListenPort(m.config.ListenAddress)
+	if err != nil {
+		return err
+	}
+	if listenPort > 0 && normalized.Port == listenPort {
+		return teelyListenPortError(normalized.Port)
+	}
 	for _, existing := range m.config.Apps {
 		if existing.ID != normalized.ID && strings.EqualFold(existing.Hostname, normalized.Hostname) {
 			return fmt.Errorf("hostname %q is already used by %q", normalized.Hostname, existing.ID)
