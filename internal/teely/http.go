@@ -1964,11 +1964,28 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
 
 var errorTemplate = template.Must(template.New("error").Parse(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ .Config.Name }} error</title></head>
-<body style="font-family: ui-rounded, sans-serif; background:#fbf3f1; color:#3c211c; padding:32px;">
-  <h1>{{ .Config.Name }} could not start</h1>
-  <p>{{ .Error }}</p>
-  {{ if .LastError }}<pre>{{ .LastError }}</pre>{{ end }}
-  <p>Open <a href="https://teely.localhost">Teely</a> for logs and controls.</p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ .Config.Name }} error</title>
+  <style>
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:linear-gradient(180deg,#f8f5ee,#efe7d8); color:#2f201d; font-family: ui-rounded, "SF Pro Text", sans-serif; }
+    .card { width:min(640px, calc(100vw - 32px)); padding:32px; background:rgba(255,255,255,0.75); border:1px solid rgba(120,55,47,0.16); border-radius:24px; box-shadow:0 20px 50px rgba(31,46,40,0.08); }
+    h1 { display:flex; align-items:center; gap:10px; margin:0 0 18px; line-height:1.08; color:#40221d; }
+    .dot { width:12px; height:12px; border-radius:999px; background:#b9473b; display:block; flex:0 0 auto; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, monospace; background:#f2eee4; border-radius:6px; }
+    code { padding:2px 6px; }
+    pre { margin:12px 0 0; padding:12px; white-space:pre-wrap; overflow:auto; color:#40221d; }
+    p { color:#655852; margin:0 0 14px; }
+    a { color:#2f5d3d; font-weight:700; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="dot"></span>{{ .Config.Name }} could not start</h1>
+    <p>{{ .Error }}</p>
+    {{ if and .LastError (ne .LastError .Error) }}<pre>{{ .LastError }}</pre>{{ end }}
+    <p>Open <a href="https://teely.localhost">Teely</a> for logs and controls.</p>
+  </div>
 </body>
 </html>`))

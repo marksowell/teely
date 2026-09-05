@@ -83,22 +83,22 @@ type Manager struct {
 type appRuntime struct {
 	cfg AppConfig
 
-	mu           sync.Mutex
-	status       AppStatus
-	adopted      bool
-	managedPID   int
-	stopping     bool
-	cmd          *exec.Cmd
-	cancel       context.CancelFunc
-	waitDone     chan struct{}
-	startedAt    *time.Time
-	lastUsedAt   *time.Time
-	lastError    string
-	exitCode     *int
-	ready        bool
-	logs         *logBuffer
-	proxy        *httputil.ReverseProxy
-	portConflict *PortConflict
+	mu            sync.Mutex
+	status        AppStatus
+	managedPID    int
+	blockedByPort bool
+	stopping      bool
+	cmd           *exec.Cmd
+	cancel        context.CancelFunc
+	waitDone      chan struct{}
+	startedAt     *time.Time
+	lastUsedAt    *time.Time
+	lastError     string
+	exitCode      *int
+	ready         bool
+	logs          *logBuffer
+	proxy         *httputil.ReverseProxy
+	portConflict  *PortConflict
 }
 
 func NewManager(configPath string) (*Manager, error) {
@@ -297,42 +297,38 @@ func (m *Manager) DeleteApp(id string) error {
 func (m *Manager) TerminatePortOwner(id string) error {
 	m.mu.RLock()
 	rt, ok := m.runtimes[id]
-	client := m.httpClient
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("unknown app %q", id)
 	}
-	rt.refreshObservedState(client)
-	state := rt.snapshot()
-	if state.PortConflict == nil {
+	conflict := detectPortConflict(rt.cfg.Port)
+	if conflict == nil {
+		rt.clearPortConflict()
 		return errors.New("no conflicting port owner found")
 	}
-	if state.PortConflict.ManagedByTeely {
+	if rt.ownsListener(conflict) {
 		return errors.New("the conflicting process is already managed by Teely")
 	}
-	process, err := os.FindProcess(state.PortConflict.PID)
+	rt.mu.Lock()
+	rt.portConflict = conflict
+	rt.mu.Unlock()
+	process, err := os.FindProcess(conflict.PID)
 	if err != nil {
 		return err
 	}
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		return err
 	}
-	log.Printf("sent SIGTERM to external process %d (%s) occupying app %s port %d", state.PortConflict.PID, state.PortConflict.Command, id, state.Config.Port)
+	log.Printf("sent SIGTERM to external process %d (%s) occupying app %s port %d", conflict.PID, conflict.Command, id, rt.cfg.Port)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if !probeTCP(state.Config.Port) {
-			rt.mu.Lock()
-			rt.portConflict = nil
-			if rt.status == StatusError && strings.Contains(rt.lastError, "port") {
-				rt.status = StatusStopped
-				rt.lastError = ""
-			}
-			rt.mu.Unlock()
+		if !probeTCP(rt.cfg.Port) {
+			rt.clearPortConflict()
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("process %d did not release port %d after SIGTERM", state.PortConflict.PID, state.Config.Port)
+	return fmt.Errorf("process %d did not release port %d after SIGTERM", conflict.PID, rt.cfg.Port)
 }
 
 func (m *Manager) UpsertApp(app AppConfig) error {
@@ -810,9 +806,27 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 	rt.mu.Lock()
 	switch rt.status {
 	case StatusRunning:
-		log.Printf("app %s already running; marking used", rt.cfg.ID)
+		rt.mu.Unlock()
+		conflict := detectPortConflict(rt.cfg.Port)
+		if conflict == nil || !rt.ownsListener(conflict) {
+			err := errors.New("Teely's managed listener is no longer available")
+			if conflict != nil {
+				err = externalPortConflictError(rt.cfg.Port, conflict)
+			}
+			rt.mu.Lock()
+			rt.status = StatusError
+			rt.ready = false
+			rt.blockedByPort = conflict != nil
+			rt.portConflict = conflict
+			rt.lastError = err.Error()
+			rt.mu.Unlock()
+			return err
+		}
+		rt.mu.Lock()
+		rt.managedPID = conflict.PID
 		rt.markUsedLocked()
 		rt.mu.Unlock()
+		log.Printf("app %s already running; marking used", rt.cfg.ID)
 		return nil
 	case StatusStarting:
 		log.Printf("app %s already starting; marking used", rt.cfg.ID)
@@ -820,43 +834,41 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 		rt.mu.Unlock()
 		return nil
 	}
-	if rt.probeReady(client) {
-		log.Printf("app %s already serving on port %d; adopting existing process", rt.cfg.ID, rt.cfg.Port)
-		rt.status = StatusRunning
-		rt.ready = true
-		rt.adopted = true
-		rt.managedPID = 0
-		rt.lastError = ""
-		rt.exitCode = nil
-		now := time.Now()
-		rt.startedAt = &now
-		rt.markUsedLocked()
-		rt.logs.Reset()
-		rt.logs.Write([]byte("[teely] adopted existing process already serving port\n"))
-		rt.mu.Unlock()
-		return nil
-	}
-	if probeTCP(rt.cfg.Port) {
-		err := fmt.Errorf("port %d is already in use, but the app did not pass its HTTP health check; stop the existing process or fix the app before starting it with Teely", rt.cfg.Port)
+	if conflict := detectPortConflict(rt.cfg.Port); conflict != nil {
+		err := externalPortConflictError(rt.cfg.Port, conflict)
 		rt.status = StatusError
 		rt.ready = false
-		rt.adopted = false
 		rt.managedPID = 0
+		rt.blockedByPort = true
+		rt.portConflict = conflict
 		rt.lastError = err.Error()
 		rt.exitCode = nil
-		now := time.Now()
-		rt.startedAt = &now
-		rt.markUsedLocked()
 		rt.logs.Reset()
-		rt.logs.Write([]byte("[teely] existing process detected on configured port, but HTTP health checks failed\n"))
-		log.Printf("app %s port %d is occupied by an unready or unhealthy process", rt.cfg.ID, rt.cfg.Port)
+		rt.logs.Write([]byte("[teely] external process detected on configured port; not starting\n"))
+		log.Printf("app %s port %d is occupied by external process %d (%s)", rt.cfg.ID, rt.cfg.Port, conflict.PID, conflict.Command)
+		rt.mu.Unlock()
+		return err
+	}
+	if probeTCP(rt.cfg.Port) {
+		err := fmt.Errorf("port %d is already in use by an external process; Teely will not start or probe it", rt.cfg.Port)
+		rt.status = StatusError
+		rt.ready = false
+		rt.managedPID = 0
+		rt.blockedByPort = true
+		rt.portConflict = nil
+		rt.lastError = err.Error()
+		rt.exitCode = nil
+		rt.logs.Reset()
+		rt.logs.Write([]byte("[teely] external process detected on configured port; not starting\n"))
+		log.Printf("app %s port %d is occupied by an unidentified external process", rt.cfg.ID, rt.cfg.Port)
 		rt.mu.Unlock()
 		return err
 	}
 
 	rt.status = StatusStarting
-	rt.adopted = false
 	rt.managedPID = 0
+	rt.blockedByPort = false
+	rt.portConflict = nil
 	rt.ready = false
 	rt.lastError = ""
 	rt.exitCode = nil
@@ -869,6 +881,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 	rt.waitDone = make(chan struct{})
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", rt.cfg.Command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = rt.cfg.WorkingDir
 	cmd.Stdout = rt.logs
 	cmd.Stderr = rt.logs
@@ -924,9 +937,6 @@ func (rt *appRuntime) watchProcess() {
 	}
 	rt.exitCode = &exitCode
 	rt.cmd = nil
-	if rt.managedPID == 0 {
-		rt.adopted = false
-	}
 	if rt.status == StatusStarting || rt.status == StatusRunning {
 		if intentionalStop {
 			rt.status = StatusStopped
@@ -949,14 +959,38 @@ func (rt *appRuntime) waitUntilReady(client *http.Client) {
 	deadline := time.Now().Add(timeout)
 	log.Printf("waiting for app %s readiness on http://127.0.0.1:%d%s for up to %s", rt.cfg.ID, rt.cfg.Port, rt.cfg.HealthPath, timeout)
 	for time.Now().Before(deadline) {
-		if rt.probeReady(client) {
+		conflict := detectPortConflict(rt.cfg.Port)
+		if conflict != nil && !rt.ownsListener(conflict) {
+			err := externalPortConflictError(rt.cfg.Port, conflict)
+			rt.mu.Lock()
+			if rt.status == StatusStarting {
+				rt.status = StatusError
+				rt.ready = false
+				rt.blockedByPort = true
+				rt.portConflict = conflict
+				rt.lastError = err.Error()
+			}
+			cmd := rt.cmd
+			rt.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				signalCommandGroup(cmd, syscall.SIGTERM)
+			}
+			log.Printf("app %s lost its startup port to external process %d (%s)", rt.cfg.ID, conflict.PID, conflict.Command)
+			return
+		}
+		if conflict != nil {
+			rt.mu.Lock()
+			rt.managedPID = conflict.PID
+			rt.portConflict = conflict
+			rt.mu.Unlock()
+		}
+		if conflict != nil && rt.probeReady(client) {
 			rt.mu.Lock()
 			if rt.status == StatusStarting {
 				rt.status = StatusRunning
 				rt.ready = true
-				if conflict := detectPortConflict(rt.cfg.Port); conflict != nil {
-					rt.managedPID = conflict.PID
-				}
+				rt.blockedByPort = false
+				rt.lastError = ""
 			}
 			rt.mu.Unlock()
 			log.Printf("app %s became ready on port %d", rt.cfg.ID, rt.cfg.Port)
@@ -974,72 +1008,51 @@ func (rt *appRuntime) waitUntilReady(client *http.Client) {
 }
 
 func (rt *appRuntime) refreshObservedState(client *http.Client) {
-	conflict := detectPortConflict(rt.cfg.Port)
 	rt.mu.Lock()
 	cmdActive := rt.cmd != nil
-	statusStarting := rt.status == StatusStarting
-	rt.portConflict = conflict
+	managedPID := rt.managedPID
+	status := rt.status
 	rt.mu.Unlock()
 
-	if cmdActive {
+	// Stopped apps are intentionally inert. Port ownership is checked only when
+	// Teely is asked to start one.
+	if !cmdActive && managedPID == 0 {
+		return
+	}
+
+	conflict := detectPortConflict(rt.cfg.Port)
+	if conflict != nil && rt.ownsListener(conflict) {
 		if rt.probeReady(client) {
 			rt.mu.Lock()
 			rt.portConflict = conflict
 			rt.status = StatusRunning
 			rt.ready = true
-			if conflict != nil && rt.managedPID == 0 {
-				rt.managedPID = conflict.PID
-			}
+			rt.managedPID = conflict.PID
+			rt.blockedByPort = false
 			rt.lastError = ""
 			rt.mu.Unlock()
 			return
 		}
 		return
 	}
-
-	if statusStarting {
-		return
-	}
-
-	if rt.probeReady(client) {
+	if conflict != nil && cmdActive {
+		err := externalPortConflictError(rt.cfg.Port, conflict)
 		rt.mu.Lock()
+		rt.status = StatusError
+		rt.ready = false
+		rt.blockedByPort = true
 		rt.portConflict = conflict
-		if rt.cmd == nil && rt.status != StatusRunning {
-			rt.status = StatusRunning
-			rt.ready = true
-			rt.adopted = !(conflict != nil && rt.managedPID != 0 && conflict.PID == rt.managedPID)
-			if rt.lastUsedAt == nil {
-				now := time.Now()
-				rt.lastUsedAt = &now
-			}
-			if rt.startedAt == nil {
-				now := time.Now()
-				rt.startedAt = &now
-			}
-			rt.lastError = ""
-		}
-		if conflict != nil && rt.managedPID == 0 && !rt.adopted {
-			rt.managedPID = conflict.PID
-		}
+		rt.lastError = err.Error()
 		rt.mu.Unlock()
 		return
 	}
-
-	rt.mu.Lock()
-	rt.portConflict = conflict
-	if rt.cmd == nil && rt.adopted {
-		rt.status = StatusStopped
+	if conflict == nil && status == StatusRunning {
+		rt.mu.Lock()
+		rt.status = StatusError
 		rt.ready = false
-		rt.adopted = false
-		rt.managedPID = 0
+		rt.lastError = "Teely's managed listener is no longer available"
+		rt.mu.Unlock()
 	}
-	if rt.cmd == nil && rt.status == StatusRunning && !rt.ready {
-		rt.status = StatusStopped
-	}
-	if rt.cmd == nil && rt.status == StatusError && rt.lastError == "" && probeTCP(rt.cfg.Port) {
-		rt.lastError = fmt.Sprintf("port %d is occupied by a process that is not returning healthy HTTP responses", rt.cfg.Port)
-	}
-	rt.mu.Unlock()
 }
 
 func (rt *appRuntime) probeReady(client *http.Client) bool {
@@ -1073,7 +1086,7 @@ func (rt *appRuntime) isReady() bool {
 	return false
 }
 
-func (rt *appRuntime) waitForReady(ctx context.Context, client *http.Client, maxWait time.Duration) (bool, error) {
+func (rt *appRuntime) waitForReady(ctx context.Context, _ *http.Client, maxWait time.Duration) (bool, error) {
 	if maxWait <= 0 {
 		maxWait = 250 * time.Millisecond
 	}
@@ -1082,25 +1095,16 @@ func (rt *appRuntime) waitForReady(ctx context.Context, client *http.Client, max
 	defer ticker.Stop()
 
 	for {
-		if rt.probeReady(client) {
-			rt.mu.Lock()
-			if rt.status == StatusStarting {
-				rt.status = StatusRunning
-			}
-			rt.ready = true
-			rt.lastError = ""
-			rt.mu.Unlock()
-			return true, nil
-		}
-
 		rt.mu.Lock()
 		status := rt.status
+		ready := rt.ready
 		lastError := rt.lastError
 		rt.mu.Unlock()
 
-		switch status {
-		case StatusRunning:
+		if status == StatusRunning && ready {
 			return true, nil
+		}
+		switch status {
 		case StatusError:
 			if strings.TrimSpace(lastError) == "" {
 				lastError = "app failed to start"
@@ -1151,7 +1155,7 @@ func (rt *appRuntime) markUsedLocked() {
 func (rt *appRuntime) stopIfIdle() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.status != StatusRunning || rt.lastUsedAt == nil || rt.adopted {
+	if rt.status != StatusRunning || rt.lastUsedAt == nil {
 		return
 	}
 	idleTimeout, _ := appParsedIdleTimeout(rt.cfg)
@@ -1164,20 +1168,6 @@ func (rt *appRuntime) stopIfIdle() {
 
 func (rt *appRuntime) stop(reason string) error {
 	rt.mu.Lock()
-	if rt.adopted {
-		if rt.probeReady(&http.Client{Timeout: 2 * time.Second}) {
-			rt.lastError = "app is running outside Teely; stop it from its original process"
-			log.Printf("app %s stop requested but process is adopted/outside Teely", rt.cfg.ID)
-			rt.mu.Unlock()
-			return errors.New("app is running outside Teely")
-		}
-		rt.adopted = false
-		rt.status = StatusStopped
-		rt.ready = false
-		rt.lastError = ""
-		rt.mu.Unlock()
-		return errAlreadyStopped
-	}
 	if rt.cmd == nil || rt.cmd.Process == nil {
 		if rt.managedPID != 0 {
 			managedPID := rt.managedPID
@@ -1192,6 +1182,8 @@ func (rt *appRuntime) stop(reason string) error {
 			rt.status = StatusStopped
 			rt.ready = false
 			rt.managedPID = 0
+			rt.blockedByPort = false
+			rt.portConflict = nil
 			rt.stopping = false
 			rt.lastError = ""
 			rt.mu.Unlock()
@@ -1200,6 +1192,8 @@ func (rt *appRuntime) stop(reason string) error {
 		rt.status = StatusStopped
 		rt.ready = false
 		rt.managedPID = 0
+		rt.blockedByPort = false
+		rt.portConflict = nil
 		rt.stopping = false
 		rt.lastError = ""
 		rt.mu.Unlock()
@@ -1217,10 +1211,10 @@ func (rt *appRuntime) stop(reason string) error {
 	log.Printf("stopping app %s: %s", rt.cfg.ID, reason)
 	rt.mu.Unlock()
 
+	signalCommandGroup(cmd, syscall.SIGTERM)
 	if cancel != nil {
 		cancel()
 	}
-	_ = cmd.Process.Signal(syscall.SIGTERM)
 	if managedPID != 0 && managedPID != cmdPID {
 		log.Printf("also stopping tracked listener pid %d for app %s", managedPID, rt.cfg.ID)
 		stopManagedListener(managedPID, rt.cfg.Port)
@@ -1229,7 +1223,7 @@ func (rt *appRuntime) stop(reason string) error {
 	select {
 	case <-rt.waitDone:
 	case <-time.After(5 * time.Second):
-		_ = cmd.Process.Kill()
+		signalCommandGroup(cmd, syscall.SIGKILL)
 		if managedPID != 0 && managedPID != cmdPID {
 			forceKillProcess(managedPID)
 		}
@@ -1237,8 +1231,12 @@ func (rt *appRuntime) stop(reason string) error {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if !probeTCP(rt.cfg.Port) {
+		conflict := detectPortConflict(rt.cfg.Port)
+		if conflict == nil {
 			break
+		}
+		if listenerOwnedByCommand(conflict, cmdPID, managedPID) {
+			forceKillProcess(conflict.PID)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -1249,6 +1247,8 @@ func (rt *appRuntime) stop(reason string) error {
 	rt.cmd = nil
 	rt.cancel = nil
 	rt.managedPID = 0
+	rt.blockedByPort = false
+	rt.portConflict = nil
 	rt.stopping = false
 	rt.lastError = ""
 	rt.mu.Unlock()
@@ -1297,6 +1297,59 @@ func clonePortConflict(conflict *PortConflict) *PortConflict {
 	}
 	copy := *conflict
 	return &copy
+}
+
+func externalPortConflictError(port int, conflict *PortConflict) error {
+	return fmt.Errorf("port %d is already held by %s (pid %d); Teely will not use an external process", port, conflict.Command, conflict.PID)
+}
+
+func (rt *appRuntime) ownsListener(conflict *PortConflict) bool {
+	if conflict == nil {
+		return false
+	}
+	rt.mu.Lock()
+	managedPID := rt.managedPID
+	commandPID := 0
+	if rt.cmd != nil && rt.cmd.Process != nil {
+		commandPID = rt.cmd.Process.Pid
+	}
+	rt.mu.Unlock()
+	if managedPID != 0 && conflict.PID == managedPID {
+		return true
+	}
+	if commandPID == 0 {
+		return false
+	}
+	processGroup, err := syscall.Getpgid(conflict.PID)
+	return err == nil && processGroup == commandPID
+}
+
+func (rt *appRuntime) clearPortConflict() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.portConflict = nil
+	if rt.blockedByPort {
+		rt.status = StatusStopped
+		rt.lastError = ""
+		rt.blockedByPort = false
+	}
+}
+
+func listenerOwnedByCommand(conflict *PortConflict, commandPID int, managedPID int) bool {
+	if conflict == nil {
+		return false
+	}
+	if managedPID != 0 && conflict.PID == managedPID {
+		return true
+	}
+	if commandPID == 0 {
+		return false
+	}
+	if conflict.PID == commandPID {
+		return true
+	}
+	processGroup, err := syscall.Getpgid(conflict.PID)
+	return err == nil && processGroup == commandPID
 }
 
 func detectPortConflict(port int) *PortConflict {
@@ -1358,6 +1411,15 @@ func forceKillProcess(pid int) {
 	process, err := os.FindProcess(pid)
 	if err == nil {
 		_ = process.Signal(syscall.SIGKILL)
+	}
+}
+
+func signalCommandGroup(cmd *exec.Cmd, signal syscall.Signal) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, signal); err != nil {
+		_ = cmd.Process.Signal(signal)
 	}
 }
 

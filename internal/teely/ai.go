@@ -121,14 +121,16 @@ func (m *Manager) DraftAppFromProject(ctx context.Context, projectPath string) (
 		return appImportDraft{}, err
 	}
 
-	base := heuristicAppDraft(snapshot, m.Config().ListenAddress)
+	cfg := m.Config()
+	base := heuristicAppDraft(snapshot, cfg.ListenAddress)
+	base = assignAvailablePort(base, snapshot, usedAppPorts(cfg.Apps, ""))
 	aiResult, err := generateAIDraft(ctx, provider.ID, model, apiKey, snapshot, base)
 	if err != nil {
 		return appImportDraft{}, err
 	}
 
 	draft := appImportDraft{
-		App:     mergeAIDraft(base, aiResult),
+		App:     assignAvailablePort(mergeAIDraft(base, aiResult), snapshot, usedAppPorts(cfg.Apps, "")),
 		Message: fmt.Sprintf("Drafted from %s using %s.", absPath, provider.Label),
 		Path:    absPath,
 	}
@@ -255,11 +257,6 @@ func detectCommand(snapshot projectSnapshot) string {
 	if pkg := parsePackageJSON(snapshot.Files["package.json"]); len(pkg.Scripts) > 0 {
 		pm := detectPackageManager(snapshot)
 		switch {
-		case pkg.Scripts["start"] != "":
-			if pm == "yarn" || pm == "bun" {
-				return pm + " start"
-			}
-			return pm + " start"
 		case pkg.Scripts["dev"] != "":
 			if pm == "yarn" {
 				return "yarn dev"
@@ -268,6 +265,11 @@ func detectCommand(snapshot projectSnapshot) string {
 				return "bun run dev"
 			}
 			return pm + " run dev"
+		case pkg.Scripts["start"] != "":
+			if pm == "yarn" || pm == "bun" {
+				return pm + " start"
+			}
+			return pm + " start"
 		}
 	}
 
@@ -327,6 +329,145 @@ func detectPackageManager(snapshot projectSnapshot) string {
 	default:
 		return "npm"
 	}
+}
+
+func usedAppPorts(apps []AppConfig, exceptID string) map[int]bool {
+	used := map[int]bool{}
+	for _, app := range apps {
+		if app.ID == exceptID {
+			continue
+		}
+		if app.Port > 0 {
+			used[app.Port] = true
+		}
+	}
+	return used
+}
+
+func assignAvailablePort(app AppConfig, snapshot projectSnapshot, used map[int]bool) AppConfig {
+	if app.Port <= 0 {
+		return app
+	}
+	canRewrite := canRewriteCommandPort(app.Command, snapshot)
+	port := nextAvailablePort(app.Port, used)
+	if port == app.Port {
+		if canRewrite {
+			app.Command = commandForPort(app.Command, snapshot, app.Port)
+		}
+		return app
+	}
+	if !canRewrite {
+		return app
+	}
+	app.Port = port
+	app.Command = commandForPort(app.Command, snapshot, port)
+	return app
+}
+
+func nextAvailablePort(start int, used map[int]bool) int {
+	if start <= 0 {
+		start = 3000
+	}
+	for port := start; port <= 65535; port++ {
+		if !used[port] {
+			return port
+		}
+	}
+	return start
+}
+
+func commandForPort(command string, snapshot projectSnapshot, port int) string {
+	command = strings.TrimSpace(command)
+	if command == "" || port <= 0 {
+		return command
+	}
+	if commandHasPortEnv(command) {
+		return replacePortEnv(command, port)
+	}
+	if isNextApp(snapshot) && isPackageScriptCommand(command, "dev", "start") {
+		return replaceOrAppendPortFlag(command, port)
+	}
+	return command
+}
+
+func canRewriteCommandPort(command string, snapshot projectSnapshot) bool {
+	command = strings.TrimSpace(command)
+	return commandHasPortEnv(command) || (isNextApp(snapshot) && isPackageScriptCommand(command, "dev", "start"))
+}
+
+func commandHasPortEnv(command string) bool {
+	return regexp.MustCompile(`(^|\s)PORT=\d{2,5}(\s|$)`).MatchString(command)
+}
+
+func replacePortEnv(command string, port int) string {
+	re := regexp.MustCompile(`(^|\s)PORT=\d{2,5}(\s|$)`)
+	return strings.TrimSpace(re.ReplaceAllString(command, fmt.Sprintf("${1}PORT=%d${2}", port)))
+}
+
+func isNextApp(snapshot projectSnapshot) bool {
+	pkg := parsePackageJSON(snapshot.Files["package.json"])
+	_, ok := mergedDeps(pkg)["next"]
+	return ok
+}
+
+func isPackageScriptCommand(command string, scripts ...string) bool {
+	fields := strings.Fields(command)
+	if len(fields) < 2 {
+		return false
+	}
+	pm := fields[0]
+	for _, script := range scripts {
+		switch pm {
+		case "npm":
+			if len(fields) >= 3 && fields[1] == "run" && fields[2] == script {
+				return true
+			}
+			if fields[1] == script {
+				return true
+			}
+		case "pnpm", "yarn":
+			if fields[1] == script {
+				return true
+			}
+			if len(fields) >= 3 && fields[1] == "run" && fields[2] == script {
+				return true
+			}
+		case "bun":
+			if len(fields) >= 3 && fields[1] == "run" && fields[2] == script {
+				return true
+			}
+			if fields[1] == script {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func replaceOrAppendPortFlag(command string, port int) string {
+	fields := strings.Fields(command)
+	portText := strconv.Itoa(port)
+	for i := 0; i < len(fields); i++ {
+		switch fields[i] {
+		case "-p", "--port":
+			if i+1 < len(fields) {
+				fields[i+1] = portText
+				return strings.Join(fields, " ")
+			}
+		default:
+			if strings.HasPrefix(fields[i], "--port=") {
+				fields[i] = "--port=" + portText
+				return strings.Join(fields, " ")
+			}
+		}
+	}
+	if len(fields) >= 3 && fields[0] == "npm" && fields[1] == "run" && !containsName(fields, "--") {
+		return strings.Join(append(fields, "--", "-p", portText), " ")
+	}
+	if len(fields) >= 2 && fields[0] == "npm" && fields[1] == "start" && !containsName(fields, "--") {
+		return strings.Join(append(fields, "--", "-p", portText), " ")
+	}
+	return strings.Join(append(fields, "-p", portText), " ")
 }
 
 func detectPort(snapshot projectSnapshot, command string) int {

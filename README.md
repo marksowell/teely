@@ -2,13 +2,15 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/marksowell/teely.svg)](https://pkg.go.dev/github.com/marksowell/teely)
 
-**Local apps that run only when you use them.**
+**Teely keeps your local web apps organized, reachable, and off until needed.**
 
-Teely automatically starts local web applications when they receive an HTTP request, waits for them to become ready, forwards the original request through the cold start, and shuts them down again after they go idle.
+Teely is a local app manager for web projects you develop, maintain, or run on your Mac. Register an app once with its project folder, startup command, port, and hostname.
 
-It gives your apps friendly `.localhost` URLs and automatic local HTTPS with Caddy, without requiring containers or app-specific launchers. Teely works with arbitrary local commands, so it can replace manually starting and stopping Node.js, Python, Rails, and similar development servers.
+After that, open a friendly HTTPS URL like `https://myapp.localhost`. Teely starts the app on demand, waits for it to become ready, forwards the original request, and shuts it down after it goes idle.
 
-Think of it as **local scale-to-zero** or **serverless for localhost**. Teely keeps your local apps teed up and ready to use without keeping all of their dev servers running all the time.
+That means your local apps stay organized and available without keeping every development server running, remembering every path and command, or accidentally routing one app to another app's port.
+
+Teely works with arbitrary local commands and does not require containers. Caddy handles local HTTPS and routing behind the scenes. A useful technical description is **local scale-to-zero**; a useful analogy is **serverless for localhost**.
 
 Conceptually:
 
@@ -43,10 +45,11 @@ From the dashboard you can:
 - configure AI support for OpenAI, Anthropic, Google
 - save AI keys into macOS Keychain
 
-Once AI is configured, **Add App with AI** appears in the dashboard which can draft an app registration from a project folder.
+Once AI is configured, **Add App with AI** appears in the dashboard. Point it at a working project folder and Teely drafts the app registration for you.
 
 ## What Teely Does
 
+- tracks local web apps in one dashboard with their paths, commands, ports, hostnames, status, and logs
 - friendly local hostnames like `https://sample-app.localhost`
 - starts apps on demand when they receive HTTP traffic
 - keeps the original request alive through cold start instead of immediately failing it
@@ -54,20 +57,32 @@ Once AI is configured, **Add App with AI** appears in the dashboard which can dr
 - routes traffic through local HTTPS with Caddy
 - stops apps after idle timeout
 - works with local app commands directly instead of requiring containers
-- gives you a built-in dashboard for setup, status, logs, and controls
+- keeps configured app ports unique so registered apps do not accidentally route to each other
+- refuses to proxy or manage external processes that are already using a registered app's port
+- can draft app registrations with AI from an existing project folder
+- gives you a built-in dashboard for app registration, setup, status, logs, and controls
 
-## Roadmap
+## AI-Assisted App Import
 
-### Targeted for `v0.3`
+Teely can inspect a project folder and draft the registration fields needed to run it locally. It reads common project files such as `README.md`, `package.json`, `Procfile`, `pyproject.toml`, compose files, and startup scripts, then combines local heuristics with your configured AI provider.
 
-- add a runtime mode per app:
-  - `host-fixed`
-  - `host-auto`
-  - `isolated`
-- add mode-aware validation:
-  - `host-fixed`: port must be unique across other `host-fixed` apps
-  - `host-auto`: no fixed-port collision check because Teely chooses one at runtime
-  - `isolated`: no host-port collision check because the app gets its own network context
+The app should already work outside Teely. AI import is meant to save the typing and catch the usual details:
+
+- project name, app ID, and `.localhost` hostname
+- working directory and startup command
+- health check path and method
+- idle and startup timeouts
+- framework defaults such as Next.js using port `3000`
+
+AI import also checks existing Teely app ports. When a drafted port is already assigned to another Teely app, it chooses the next available port if it can also update the command safely. For example, a Next.js app that would normally use `npm run dev` on port `3000` can be drafted as:
+
+```bash
+npm run dev -- -p 3001
+```
+
+with the app port set to `3001`. If Teely cannot confidently rewrite the command, it leaves the draft alone so the normal validation can catch the port conflict.
+
+AI configuration lives in Teely setup. The provider and model are stored in Teely config, and API keys are securely stored separately in macOS Keychain.
 
 ## Related Projects
 
