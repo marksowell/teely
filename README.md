@@ -6,11 +6,13 @@
 
 Teely is a local app manager for web projects you develop, maintain, or run on your Mac. Register an app once with its project folder, startup command, port, and hostname.
 
-After that, open a friendly HTTPS URL like `https://myapp.localhost`. Teely starts the app on demand, waits for it to become ready, forwards the original request, and shuts it down after it goes idle.
+After that, open a friendly HTTPS URL like `https://sample-app.localhost`. Teely starts the app on demand, waits for it to become ready, forwards the original request, and shuts it down after it goes idle.
 
 That means your local apps stay organized and available without keeping every development server running, remembering every path and command, or accidentally routing one app to another app's port.
 
-Teely works with arbitrary local commands and does not require containers. Caddy handles local HTTPS and routing behind the scenes. A useful technical description is **local scale-to-zero**; a useful analogy is **serverless for localhost**.
+Teely works with arbitrary local commands and does not require containers. Caddy handles local HTTPS and routing behind the scenes.
+
+Think of Teely as **local scale-to-zero** or **serverless for localhost**. Teely keeps your local apps teed up and ready to use, starting their dev servers on demand and shutting them down when they’re no longer needed.
 
 Conceptually:
 
