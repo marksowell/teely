@@ -228,6 +228,7 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	isEditing := strings.EqualFold(strings.TrimSpace(r.FormValue("form_mode")), "edit")
 	port, err := strconv.Atoi(r.FormValue("port"))
 	if err != nil {
 		app := AppConfig{
@@ -242,8 +243,7 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 			StartupTimeout:  strings.TrimSpace(r.FormValue("startup_timeout")),
 			CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
 		}
-		_, exists := m.GetAppByID(app.ID)
-		m.renderRegisterFormError(w, app, "Port must be a number.", exists)
+		m.renderRegisterFormError(w, app, "Port must be a number.", isEditing)
 		return
 	}
 	app := AppConfig{
@@ -260,6 +260,14 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 		CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
 	}
 	existing, exists := m.GetAppByID(app.ID)
+	if isEditing && !exists {
+		m.renderRegisterFormError(w, app, fmt.Sprintf("Cannot edit unknown app %q.", app.ID), false)
+		return
+	}
+	if !isEditing && exists {
+		m.renderRegisterFormError(w, app, fmt.Sprintf("App ID %q already exists. Choose a different ID to create another app.", app.ID), false)
+		return
+	}
 	wasActive := false
 	needsRestart := false
 	if exists {
@@ -1191,6 +1199,33 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     .modal.modal-ai {
       background: color-mix(in srgb, var(--green-soft) 28%, var(--panel-strong));
     }
+    .path-input-shell {
+      position: relative;
+    }
+    .path-input-shell input {
+      padding-right: 42px;
+    }
+    .path-spinner {
+      position: absolute;
+      top: 50%;
+      right: 14px;
+      width: 16px;
+      height: 16px;
+      margin-top: -8px;
+      border: 2px solid color-mix(in srgb, var(--accent) 22%, transparent);
+      border-top-color: var(--accent-strong);
+      border-radius: 999px;
+      opacity: 0;
+      pointer-events: none;
+      animation: spin 0.75s linear infinite;
+      transition: opacity 0.12s ease;
+    }
+    .modal-form.is-analyzing .path-spinner {
+      opacity: 1;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
     .modal-ai-title {
       display: inline-flex;
       align-items: center;
@@ -1594,7 +1629,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         <form class="modal-form" method="post" action="/__teely/import">
           {{ if .AIConfigError }}<div class="notice danger-banner">{{ .AIConfigError }}</div>{{ end }}
           {{ if .ImportError }}<div class="notice danger-banner">{{ .ImportError }}</div>{{ end }}
-          <label>Project Path<input name="project_path" placeholder="/absolute/path/to/your-app" value="{{ .ImportPath }}" required></label>
+          <label>Project Path<span class="path-input-shell"><input name="project_path" placeholder="/absolute/path/to/your-app" value="{{ .ImportPath }}" required><span class="path-spinner" aria-hidden="true"></span></span></label>
           <div class="form-actions">
             <button type="submit" class="ai-link" {{ if not .AIEnabled }}disabled aria-disabled="true"{{ end }}>Analyze Folder</button>
             <a class="button-link secondary" href="/">Cancel</a>
@@ -1627,6 +1662,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. Changing the hostname updates routing to the new URL after save.</div>
         {{ end }}
         <form class="modal-form" method="post" action="/__teely/register" {{ if .IsEditing }}data-original-app='{{ toJSON .FormState.Config }}' data-app-active="{{ if restartRequiredForView .FormState }}true{{ else }}false{{ end }}"{{ end }}>
+          <input type="hidden" name="form_mode" value="{{ if .IsEditing }}edit{{ else }}create{{ end }}">
           {{ if .FormError }}<div class="notice danger-banner">{{ .FormError }}</div>{{ end }}
           <div class="field-grid">
             <label>ID<input name="id" placeholder="sample-app" value="{{ .FormState.Config.ID }}" {{ if .IsEditing }}readonly{{ end }} required></label>
@@ -1915,6 +1951,17 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         provider.addEventListener("change", syncFetchButton);
         apiKey.addEventListener("input", syncFetchButton);
         syncFetchButton();
+      });
+
+      document.querySelectorAll('form[action="/__teely/import"]').forEach((form) => {
+        const button = form.querySelector('button[type="submit"]');
+        form.addEventListener("submit", () => {
+          form.classList.add("is-analyzing");
+          if (button) {
+            button.disabled = true;
+            button.textContent = "Analyzing...";
+          }
+        });
       });
 
       const params = new URLSearchParams(window.location.search);

@@ -44,6 +44,15 @@ var (
 		"compose.yml",
 		"compose.yaml",
 		".env.example",
+		"server.js",
+		"server.mjs",
+		"server.ts",
+		"app.js",
+		"app.mjs",
+		"app.ts",
+		"index.js",
+		"index.mjs",
+		"index.ts",
 		"scripts/run-webapp.sh",
 		"scripts/start.sh",
 		"start.sh",
@@ -65,6 +74,15 @@ var (
 		"compose.yml",
 		"compose.yaml",
 		".env.example",
+		"server.js",
+		"server.mjs",
+		"server.ts",
+		"app.js",
+		"app.mjs",
+		"app.ts",
+		"index.js",
+		"index.mjs",
+		"index.ts",
 	}
 	importPromptFiles = []string{
 		"README.md",
@@ -79,6 +97,15 @@ var (
 		"docker-compose.yaml",
 		"compose.yml",
 		"compose.yaml",
+		"server.js",
+		"server.mjs",
+		"server.ts",
+		"app.js",
+		"app.mjs",
+		"app.ts",
+		"index.js",
+		"index.mjs",
+		"index.ts",
 		"scripts/run-webapp.sh",
 		"scripts/start.sh",
 		"start.sh",
@@ -124,13 +151,14 @@ func (m *Manager) DraftAppFromProject(ctx context.Context, projectPath string) (
 	cfg := m.Config()
 	base := heuristicAppDraft(snapshot, cfg.ListenAddress)
 	base = assignAvailablePort(base, snapshot, usedAppPorts(cfg.Apps, ""))
+	base = assignAvailableIdentity(base, cfg.Apps)
 	aiResult, err := generateAIDraft(ctx, provider.ID, model, apiKey, snapshot, base)
 	if err != nil {
 		return appImportDraft{}, err
 	}
 
 	draft := appImportDraft{
-		App:     assignAvailablePort(mergeAIDraft(base, aiResult), snapshot, usedAppPorts(cfg.Apps, "")),
+		App:     assignAvailableIdentity(assignAvailablePort(mergeAIDraft(base, aiResult), snapshot, usedAppPorts(cfg.Apps, "")), cfg.Apps),
 		Message: fmt.Sprintf("Drafted from %s using %s.", absPath, provider.Label),
 		Path:    absPath,
 	}
@@ -344,6 +372,40 @@ func usedAppPorts(apps []AppConfig, exceptID string) map[int]bool {
 	return used
 }
 
+func assignAvailableIdentity(app AppConfig, apps []AppConfig) AppConfig {
+	usedIDs := map[string]bool{}
+	usedHosts := map[string]bool{}
+	for _, existing := range apps {
+		usedIDs[existing.ID] = true
+		usedHosts[strings.ToLower(strings.TrimSpace(existing.Hostname))] = true
+	}
+	if !usedIDs[app.ID] && !usedHosts[strings.ToLower(strings.TrimSpace(app.Hostname))] {
+		return app
+	}
+
+	baseID := slugify(app.ID)
+	if baseID == "" {
+		baseID = "sample-app"
+	}
+	baseHost := strings.ToLower(strings.TrimSpace(app.Hostname))
+	hostFollowsID := baseHost == "" || baseHost == strings.ToLower(app.ID+".localhost")
+	for i := 2; i < 1000; i++ {
+		nextID := fmt.Sprintf("%s-%d", baseID, i)
+		nextHost := strings.ToLower(strings.TrimSpace(app.Hostname))
+		if hostFollowsID || usedHosts[nextHost] {
+			nextHost = nextID + ".localhost"
+		}
+		if !usedIDs[nextID] && !usedHosts[nextHost] {
+			app.ID = nextID
+			if hostFollowsID || usedHosts[strings.ToLower(strings.TrimSpace(app.Hostname))] {
+				app.Hostname = nextHost
+			}
+			return app
+		}
+	}
+	return app
+}
+
 func assignAvailablePort(app AppConfig, snapshot projectSnapshot, used map[int]bool) AppConfig {
 	if app.Port <= 0 {
 		return app
@@ -384,6 +446,9 @@ func commandForPort(command string, snapshot projectSnapshot, port int) string {
 	if commandHasPortEnv(command) {
 		return replacePortEnv(command, port)
 	}
+	if projectUsesPortEnv(snapshot) {
+		return prependPortEnv(command, port)
+	}
 	if isNextApp(snapshot) && isPackageScriptCommand(command, "dev", "start") {
 		return replaceOrAppendPortFlag(command, port)
 	}
@@ -392,7 +457,9 @@ func commandForPort(command string, snapshot projectSnapshot, port int) string {
 
 func canRewriteCommandPort(command string, snapshot projectSnapshot) bool {
 	command = strings.TrimSpace(command)
-	return commandHasPortEnv(command) || (isNextApp(snapshot) && isPackageScriptCommand(command, "dev", "start"))
+	return commandHasPortEnv(command) ||
+		projectUsesPortEnv(snapshot) ||
+		(isNextApp(snapshot) && isPackageScriptCommand(command, "dev", "start"))
 }
 
 func commandHasPortEnv(command string) bool {
@@ -402,6 +469,27 @@ func commandHasPortEnv(command string) bool {
 func replacePortEnv(command string, port int) string {
 	re := regexp.MustCompile(`(^|\s)PORT=\d{2,5}(\s|$)`)
 	return strings.TrimSpace(re.ReplaceAllString(command, fmt.Sprintf("${1}PORT=%d${2}", port)))
+}
+
+func prependPortEnv(command string, port int) string {
+	return fmt.Sprintf("PORT=%d %s", port, command)
+}
+
+func projectUsesPortEnv(snapshot projectSnapshot) bool {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\bprocess\.env\.PORT\b`),
+		regexp.MustCompile(`(?i)\bos\.environ\.get\(["']PORT["']\)`),
+		regexp.MustCompile(`(?i)\bos\.getenv\(["']PORT["']\)`),
+		regexp.MustCompile(`(?i)\bENV\[['"]PORT['"]\]`),
+	}
+	for _, content := range snapshot.Files {
+		for _, re := range patterns {
+			if re.MatchString(content) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isNextApp(snapshot projectSnapshot) bool {
@@ -661,6 +749,7 @@ func mergeAIDraft(base AppConfig, ai aiDraftResponse) AppConfig {
 	if strings.TrimSpace(out.Hostname) == "" && out.ID != "" {
 		out.Hostname = out.ID + ".localhost"
 	}
+	out.Name = normalizeDisplayName(out.Name, out.ID)
 	return out
 }
 
@@ -1125,12 +1214,43 @@ func humanizeName(value string) string {
 	value = strings.ReplaceAll(value, "-", " ")
 	fields := strings.Fields(value)
 	for i, field := range fields {
-		fields[i] = strings.ToUpper(field[:1]) + field[1:]
+		fields[i] = humanizeNameToken(field)
 	}
 	if len(fields) == 0 {
 		return "Sample App"
 	}
 	return strings.Join(fields, " ")
+}
+
+func normalizeDisplayName(name, id string) string {
+	name = strings.TrimSpace(name)
+	id = strings.TrimSpace(id)
+	if name == "" {
+		return humanizeName(id)
+	}
+	if strings.EqualFold(name, id) || (strings.ContainsAny(name, "-_") && strings.EqualFold(slugify(name), id)) {
+		return humanizeName(id)
+	}
+	return name
+}
+
+func humanizeNameToken(value string) string {
+	lower := strings.ToLower(value)
+	switch lower {
+	case "ai", "api", "http", "https", "id", "ui", "url":
+		return strings.ToUpper(lower)
+	case "oauth":
+		return "OAuth"
+	case "ios":
+		return "iOS"
+	case "macos":
+		return "macOS"
+	default:
+		if value == "" {
+			return ""
+		}
+		return strings.ToUpper(value[:1]) + strings.ToLower(value[1:])
+	}
 }
 
 func trimPackageName(value string) string {
