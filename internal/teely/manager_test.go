@@ -2,6 +2,7 @@ package teely
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"os/exec"
@@ -107,6 +108,108 @@ func TestListenerOwnedByCommandRecognizesChildListener(t *testing.T) {
 	}
 	if !listenerOwnedByCommand(conflict, cmd.Process.Pid, 0) {
 		t.Fatalf("listener pid %d was not recognized as owned by command pid %d", conflict.PID, cmd.Process.Pid)
+	}
+}
+
+func TestWatchProcessIgnoresStaleCommand(t *testing.T) {
+	rt := newAppRuntime(AppConfig{ID: "stale-command", Port: 1})
+	oldCmd := exec.Command("/bin/sh", "-c", "sleep 0.1; exit 7")
+	if err := oldCmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitDone := make(chan struct{})
+	rt.mu.Lock()
+	rt.cmd = oldCmd
+	rt.waitDone = waitDone
+	rt.status = StatusRunning
+	rt.ready = true
+	rt.mu.Unlock()
+
+	go rt.watchProcess(oldCmd, waitDone)
+
+	rt.mu.Lock()
+	rt.cmd = exec.Command("/bin/sh", "-c", "sleep 1")
+	rt.mu.Unlock()
+
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale process watcher did not finish")
+	}
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.status != StatusRunning {
+		t.Fatalf("status = %s, want %s", rt.status, StatusRunning)
+	}
+	if !rt.ready {
+		t.Fatal("stale watcher cleared readiness")
+	}
+	if rt.exitCode != nil {
+		t.Fatalf("stale watcher set exit code to %d", *rt.exitCode)
+	}
+	if rt.lastError != "" {
+		t.Fatalf("stale watcher set error %q", rt.lastError)
+	}
+}
+
+func TestStopCleansTeelyOwnedListenerWithoutCommandHandle(t *testing.T) {
+	listener, err := net.Listen("tcp", net.JoinHostPort("::1", "0"))
+	if err != nil {
+		t.Skipf("IPv6 loopback is not available: %v", err)
+	}
+	_, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	listener.Close()
+	port := mustAtoi(t, portText)
+
+	cmd := exec.Command("/bin/sh", "-c", "python3 -m http.server "+portText+" --bind ::1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	var conflict *PortConflict
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conflict = detectPortConflict(port)
+		if conflict != nil && teelyOwnedListener(conflict) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if conflict == nil {
+		t.Fatalf("listener on port %s was not detected", portText)
+	}
+
+	rt := newAppRuntime(AppConfig{ID: "orphan-listener", Port: port})
+	rt.status = StatusError
+	rt.portConflict = conflict
+	if err := rt.stop("test stop"); err != nil {
+		t.Fatal(err)
+	}
+	if conflict := detectPortConflict(port); conflict != nil {
+		t.Fatalf("listener remained after stop: pid=%d command=%s address=%s", conflict.PID, conflict.Command, conflict.Address)
+	}
+	if rt.status != StatusStopped {
+		t.Fatalf("status = %s, want %s", rt.status, StatusStopped)
+	}
+}
+
+func TestStopDoesNotCleanStaleListenerForStoppedApp(t *testing.T) {
+	rt := newAppRuntime(AppConfig{ID: "stopped-app", Port: 1, WorkingDir: "."})
+	rt.status = StatusStopped
+	if err := rt.stop("test stop"); !errors.Is(err, errAlreadyStopped) {
+		t.Fatalf("stop error = %v, want %v", err, errAlreadyStopped)
 	}
 }
 

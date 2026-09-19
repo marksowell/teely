@@ -118,6 +118,12 @@ If routing or HTTPS is acting up, restart both processes:
 teely restart
 ```
 
+When developing Teely from this repository with the macOS launch agent enabled, rebuild and refresh the running app with:
+
+```bash
+./scripts/dev-refresh.sh
+```
+
 Teely keeps logs under your configured `runtime_dir`.
 
 Default install location:

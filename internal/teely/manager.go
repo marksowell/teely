@@ -959,20 +959,25 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 		return err
 	}
 	rt.cmd = cmd
+	waitDone := rt.waitDone
 	log.Printf("app %s spawned with pid %d", rt.cfg.ID, cmd.Process.Pid)
 	rt.mu.Unlock()
 
-	go rt.watchProcess()
+	go rt.watchProcess(cmd, waitDone)
 	go rt.waitUntilReady(client)
 	return nil
 }
 
-func (rt *appRuntime) watchProcess() {
-	defer close(rt.waitDone)
-	err := rt.cmd.Wait()
+func (rt *appRuntime) watchProcess(cmd *exec.Cmd, waitDone chan struct{}) {
+	defer close(waitDone)
+	err := cmd.Wait()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	if rt.cmd != cmd {
+		log.Printf("app %s process exited after runtime was replaced; ignoring stale watcher", rt.cfg.ID)
+		return
+	}
 	intentionalStop := rt.stopping
 	exitCode := 0
 	if err != nil {
@@ -1254,28 +1259,31 @@ func (rt *appRuntime) stop(reason string) error {
 			stopManagedListener(managedPID, rt.cfg.Port)
 
 			rt.mu.Lock()
-			rt.status = StatusStopped
-			rt.ready = false
-			rt.managedPID = 0
-			rt.blockedByPort = false
-			rt.portConflict = nil
-			rt.stopping = false
-			rt.lastError = ""
+			rt.markStoppedLocked()
 			rt.mu.Unlock()
 			return nil
 		}
-		rt.status = StatusStopped
-		rt.ready = false
-		rt.managedPID = 0
-		rt.blockedByPort = false
-		rt.portConflict = nil
-		rt.stopping = false
-		rt.lastError = ""
+		conflict := detectPortConflict(rt.cfg.Port)
+		if rt.status != StatusStopped && rt.listenerMatchesAppWorkingDir(conflict) {
+			rt.stopping = true
+			rt.logs.Write([]byte("\n[teely] " + reason + "\n"))
+			log.Printf("stopping app %s via stale app listener pid %d: %s", rt.cfg.ID, conflict.PID, reason)
+			rt.mu.Unlock()
+
+			stopManagedListener(conflict.PID, rt.cfg.Port)
+
+			rt.mu.Lock()
+			rt.markStoppedLocked()
+			rt.mu.Unlock()
+			return nil
+		}
+		rt.markStoppedLocked()
 		rt.mu.Unlock()
 		return errAlreadyStopped
 	}
 	cmd := rt.cmd
 	cancel := rt.cancel
+	waitDone := rt.waitDone
 	managedPID := rt.managedPID
 	cmdPID := 0
 	if cmd.Process != nil {
@@ -1296,7 +1304,7 @@ func (rt *appRuntime) stop(reason string) error {
 	}
 
 	select {
-	case <-rt.waitDone:
+	case <-waitDone:
 	case <-time.After(5 * time.Second):
 		signalCommandGroup(cmd, syscall.SIGKILL)
 		if managedPID != 0 && managedPID != cmdPID {
@@ -1317,17 +1325,21 @@ func (rt *appRuntime) stop(reason string) error {
 	}
 
 	rt.mu.Lock()
-	rt.status = StatusStopped
-	rt.ready = false
+	rt.markStoppedLocked()
 	rt.cmd = nil
 	rt.cancel = nil
+	rt.mu.Unlock()
+	return nil
+}
+
+func (rt *appRuntime) markStoppedLocked() {
+	rt.status = StatusStopped
+	rt.ready = false
 	rt.managedPID = 0
 	rt.blockedByPort = false
 	rt.portConflict = nil
 	rt.stopping = false
 	rt.lastError = ""
-	rt.mu.Unlock()
-	return nil
 }
 
 func (rt *appRuntime) snapshot() AppState {
@@ -1396,6 +1408,9 @@ func (rt *appRuntime) ownsListener(conflict *PortConflict) bool {
 	if managedPID != 0 && conflict.PID == managedPID {
 		return true
 	}
+	if teelyOwnedListener(conflict) {
+		return true
+	}
 	if commandPID == 0 {
 		return false
 	}
@@ -1424,6 +1439,9 @@ func listenerOwnedByCommand(conflict *PortConflict, commandPID int, managedPID i
 	if managedPID != 0 && conflict.PID == managedPID {
 		return true
 	}
+	if teelyOwnedListener(conflict) {
+		return true
+	}
 	if commandPID == 0 {
 		return false
 	}
@@ -1435,6 +1453,20 @@ func listenerOwnedByCommand(conflict *PortConflict, commandPID int, managedPID i
 	}
 	processGroup, err := syscall.Getpgid(conflict.PID)
 	return err == nil && processGroup == commandPID
+}
+
+func teelyOwnedListener(conflict *PortConflict) bool {
+	return conflict != nil && processDescendsFrom(conflict.PID, os.Getpid())
+}
+
+func (rt *appRuntime) listenerMatchesAppWorkingDir(conflict *PortConflict) bool {
+	if conflict == nil {
+		return false
+	}
+	if teelyOwnedListener(conflict) {
+		return true
+	}
+	return processTreeHasWorkingDir(conflict.PID, rt.cfg.WorkingDir)
 }
 
 func processDescendsFrom(pid int, ancestorPID int) bool {
@@ -1452,6 +1484,46 @@ func processDescendsFrom(pid int, ancestorPID int) bool {
 		current = parent
 	}
 	return false
+}
+
+func processTreeHasWorkingDir(pid int, workingDir string) bool {
+	if pid <= 0 || strings.TrimSpace(workingDir) == "" {
+		return false
+	}
+	want := cleanComparablePath(workingDir)
+	for current := pid; current > 1; {
+		if cwd, err := processWorkingDir(current); err == nil && cleanComparablePath(cwd) == want {
+			return true
+		}
+		parent, err := parentPID(current)
+		if err != nil || parent <= 0 {
+			return false
+		}
+		current = parent
+	}
+	return false
+}
+
+func processWorkingDir(pid int) (string, error) {
+	cmd := exec.Command("/usr/sbin/lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return strings.TrimSpace(line[1:]), nil
+		}
+	}
+	return "", errors.New("process working directory not found")
+}
+
+func cleanComparablePath(path string) string {
+	cleaned := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		return resolved
+	}
+	return cleaned
 }
 
 func parentPID(pid int) (int, error) {
@@ -1497,6 +1569,7 @@ func detectPortConflict(port int) *PortConflict {
 }
 
 func stopManagedListener(pid int, port int) {
+	signalProcessGroup(pid, syscall.SIGTERM)
 	process, err := os.FindProcess(pid)
 	if err == nil {
 		_ = process.Signal(syscall.SIGTERM)
@@ -1509,6 +1582,7 @@ func stopManagedListener(pid int, port int) {
 		time.Sleep(250 * time.Millisecond)
 	}
 	forceKillProcess(pid)
+	signalProcessGroup(pid, syscall.SIGKILL)
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if !probeTCP(port) {
@@ -1523,6 +1597,17 @@ func forceKillProcess(pid int) {
 	if err == nil {
 		_ = process.Signal(syscall.SIGKILL)
 	}
+}
+
+func signalProcessGroup(pid int, signal syscall.Signal) {
+	if pid <= 0 {
+		return
+	}
+	processGroup, err := syscall.Getpgid(pid)
+	if err != nil || processGroup <= 0 {
+		return
+	}
+	_ = syscall.Kill(-processGroup, signal)
 }
 
 func signalCommandGroup(cmd *exec.Cmd, signal syscall.Signal) {

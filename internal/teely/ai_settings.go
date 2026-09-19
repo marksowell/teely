@@ -133,7 +133,7 @@ func buildAISetupState(cfg Config) AISetupState {
 	if ok && key != "" {
 		if ai.Model != "" {
 			state.Enabled = true
-			state.StatusLabel = "Ready"
+			state.StatusLabel = "Configured"
 			state.StatusClass = "running"
 		} else {
 			state.StatusLabel = "Missing"

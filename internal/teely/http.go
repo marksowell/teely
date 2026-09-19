@@ -81,6 +81,7 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 		renderDashboard(w, dashboardView{
 			Config:          cfg,
+			Version:         DisplayVersion(),
 			Apps:            apps,
 			CaddySnippet:    m.CaddySnippet(),
 			Editing:         editing,
@@ -305,6 +306,7 @@ func (m *Manager) handleImport(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		renderDashboard(w, dashboardView{
 			Config:        cfg,
+			Version:       DisplayVersion(),
 			Apps:          apps,
 			CaddySnippet:  m.CaddySnippet(),
 			Setup:         setup,
@@ -323,6 +325,7 @@ func (m *Manager) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	renderDashboard(w, dashboardView{
 		Config:        cfg,
+		Version:       DisplayVersion(),
 		Apps:          apps,
 		CaddySnippet:  m.CaddySnippet(),
 		Setup:         setup,
@@ -489,6 +492,7 @@ func renderAppCaddyBlock(app AppConfig, listenAddress string) string {
 
 type dashboardView struct {
 	Config          Config
+	Version         string
 	Apps            []AppState
 	CaddySnippet    string
 	Editing         *AppState
@@ -534,6 +538,7 @@ func (m *Manager) renderRegisterFormError(w http.ResponseWriter, app AppConfig, 
 	}
 	renderDashboard(w, dashboardView{
 		Config:          cfg,
+		Version:         DisplayVersion(),
 		Apps:            apps,
 		CaddySnippet:    m.CaddySnippet(),
 		Setup:           setup,
@@ -817,9 +822,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     .main { display: grid; gap: 16px; margin-top: 8px; }
     .footer {
       display: flex;
+      align-items: center;
       justify-content: center;
+      gap: 10px;
       margin-top: auto;
       padding: 18px 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
     }
     .footer-link {
       display: inline-flex;
@@ -840,6 +850,14 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       height: 14px;
       fill: currentColor;
       flex: 0 0 auto;
+    }
+    .footer-version {
+      color: color-mix(in srgb, var(--muted) 78%, transparent);
+    }
+    .footer-version::before {
+      content: "•";
+      margin-right: 10px;
+      color: color-mix(in srgb, var(--muted) 45%, transparent);
     }
     .stats {
       display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0;
@@ -1609,6 +1627,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         </svg>
         <span>View Teely on GitHub</span>
       </a>
+      <span class="footer-version">{{ .Version }}</span>
     </footer>
   </div>
 
