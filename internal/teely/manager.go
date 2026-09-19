@@ -1399,6 +1399,9 @@ func (rt *appRuntime) ownsListener(conflict *PortConflict) bool {
 	if commandPID == 0 {
 		return false
 	}
+	if processDescendsFrom(conflict.PID, commandPID) {
+		return true
+	}
 	processGroup, err := syscall.Getpgid(conflict.PID)
 	return err == nil && processGroup == commandPID
 }
@@ -1427,8 +1430,37 @@ func listenerOwnedByCommand(conflict *PortConflict, commandPID int, managedPID i
 	if conflict.PID == commandPID {
 		return true
 	}
+	if processDescendsFrom(conflict.PID, commandPID) {
+		return true
+	}
 	processGroup, err := syscall.Getpgid(conflict.PID)
 	return err == nil && processGroup == commandPID
+}
+
+func processDescendsFrom(pid int, ancestorPID int) bool {
+	if pid <= 0 || ancestorPID <= 0 {
+		return false
+	}
+	for current := pid; current > 1; {
+		parent, err := parentPID(current)
+		if err != nil || parent <= 0 {
+			return false
+		}
+		if parent == ancestorPID {
+			return true
+		}
+		current = parent
+	}
+	return false
+}
+
+func parentPID(pid int) (int, error) {
+	cmd := exec.Command("/bin/ps", "-o", "ppid=", "-p", strconv.Itoa(pid))
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(output)))
 }
 
 func detectPortConflict(port int) *PortConflict {
