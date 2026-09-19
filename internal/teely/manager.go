@@ -98,6 +98,7 @@ type appRuntime struct {
 	ready         bool
 	logs          *logBuffer
 	proxy         *httputil.ReverseProxy
+	proxyTarget   string
 	portConflict  *PortConflict
 }
 
@@ -761,7 +762,8 @@ func (m *Manager) rebuildFromConfigLocked() {
 		hostToApp[strings.ToLower(app.Hostname)] = app.ID
 		if existing, ok := m.runtimes[app.ID]; ok {
 			existing.cfg = app
-			existing.proxy = newReverseProxy(app)
+			existing.proxyTarget = defaultLoopbackTarget(app.Port)
+			existing.proxy = newReverseProxy(existing)
 			newRuntimes[app.ID] = existing
 			continue
 		}
@@ -788,23 +790,55 @@ func (m *Manager) idleLoop() {
 }
 
 func newAppRuntime(cfg AppConfig) *appRuntime {
-	return &appRuntime{
+	rt := &appRuntime{
 		cfg:    cfg,
 		status: StatusStopped,
 		logs:   newLogBuffer(16 * 1024),
-		proxy:  newReverseProxy(cfg),
 	}
+	rt.proxy = newReverseProxy(rt)
+	rt.proxyTarget = defaultLoopbackTarget(cfg.Port)
+	return rt
 }
 
-func newReverseProxy(cfg AppConfig) *httputil.ReverseProxy {
-	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cfg.Port))
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	original := proxy.Director
+func newReverseProxy(rt *appRuntime) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(rt.cfg.Port))})
 	proxy.Director = func(r *http.Request) {
-		original(r)
+		target := rt.currentProxyTarget()
+		r.URL.Scheme = target.Scheme
+		r.URL.Host = target.Host
 		r.Host = target.Host
+		if _, ok := r.Header["User-Agent"]; !ok {
+			r.Header.Set("User-Agent", "")
+		}
 	}
 	return proxy
+}
+
+func (rt *appRuntime) currentProxyTarget() *url.URL {
+	rt.mu.Lock()
+	targetText := rt.proxyTarget
+	rt.mu.Unlock()
+	if strings.TrimSpace(targetText) == "" {
+		targetText = defaultLoopbackTarget(rt.cfg.Port)
+	}
+	target, err := url.Parse(targetText)
+	if err != nil {
+		target, _ = url.Parse(defaultLoopbackTarget(rt.cfg.Port))
+	}
+	return target
+}
+
+func defaultLoopbackTarget(port int) string {
+	return "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+func loopbackTargets(port int) []string {
+	portText := strconv.Itoa(port)
+	return []string{
+		"http://" + net.JoinHostPort("127.0.0.1", portText),
+		"http://" + net.JoinHostPort("::1", portText),
+		"http://" + net.JoinHostPort("localhost", portText),
+	}
 }
 
 var errAlreadyStopped = errors.New("already stopped")
@@ -815,6 +849,16 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 	case StatusRunning:
 		rt.mu.Unlock()
 		conflict := detectPortConflict(rt.cfg.Port)
+		if conflict == nil {
+			if ready, target := rt.probeReady(client); ready {
+				rt.mu.Lock()
+				rt.proxyTarget = target
+				rt.markUsedLocked()
+				rt.mu.Unlock()
+				log.Printf("app %s already running on %s; marking used", rt.cfg.ID, target)
+				return nil
+			}
+		}
 		if conflict == nil || !rt.ownsListener(conflict) {
 			err := errors.New("Teely's managed listener is no longer available")
 			if conflict != nil {
@@ -831,6 +875,9 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 		}
 		rt.mu.Lock()
 		rt.managedPID = conflict.PID
+		if ready, target := rt.probeReady(client); ready {
+			rt.proxyTarget = target
+		}
 		rt.markUsedLocked()
 		rt.mu.Unlock()
 		log.Printf("app %s already running; marking used", rt.cfg.ID)
@@ -877,6 +924,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 	rt.blockedByPort = false
 	rt.portConflict = nil
 	rt.ready = false
+	rt.proxyTarget = defaultLoopbackTarget(rt.cfg.Port)
 	rt.lastError = ""
 	rt.exitCode = nil
 	now := time.Now()
@@ -964,7 +1012,7 @@ func (rt *appRuntime) watchProcess() {
 func (rt *appRuntime) waitUntilReady(client *http.Client) {
 	timeout, _ := appParsedStartupTimeout(rt.cfg)
 	deadline := time.Now().Add(timeout)
-	log.Printf("waiting for app %s readiness on http://127.0.0.1:%d%s for up to %s", rt.cfg.ID, rt.cfg.Port, rt.cfg.HealthPath, timeout)
+	log.Printf("waiting for app %s readiness on loopback port %d%s for up to %s", rt.cfg.ID, rt.cfg.Port, rt.cfg.HealthPath, timeout)
 	for time.Now().Before(deadline) {
 		conflict := detectPortConflict(rt.cfg.Port)
 		if conflict != nil && !rt.ownsListener(conflict) {
@@ -991,16 +1039,17 @@ func (rt *appRuntime) waitUntilReady(client *http.Client) {
 			rt.portConflict = conflict
 			rt.mu.Unlock()
 		}
-		if conflict != nil && rt.probeReady(client) {
+		if ready, target := rt.probeReady(client); ready {
 			rt.mu.Lock()
 			if rt.status == StatusStarting {
 				rt.status = StatusRunning
 				rt.ready = true
+				rt.proxyTarget = target
 				rt.blockedByPort = false
 				rt.lastError = ""
 			}
 			rt.mu.Unlock()
-			log.Printf("app %s became ready on port %d", rt.cfg.ID, rt.cfg.Port)
+			log.Printf("app %s became ready on %s", rt.cfg.ID, target)
 			return
 		}
 		time.Sleep(1 * time.Second)
@@ -1029,16 +1078,29 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 
 	conflict := detectPortConflict(rt.cfg.Port)
 	if conflict != nil && rt.ownsListener(conflict) {
-		if rt.probeReady(client) {
+		if ready, target := rt.probeReady(client); ready {
 			rt.mu.Lock()
 			rt.portConflict = conflict
 			rt.status = StatusRunning
 			rt.ready = true
+			rt.proxyTarget = target
 			rt.managedPID = conflict.PID
 			rt.blockedByPort = false
 			rt.lastError = ""
 			rt.mu.Unlock()
 			return
+		}
+		return
+	}
+	if conflict == nil && cmdActive {
+		if ready, target := rt.probeReady(client); ready {
+			rt.mu.Lock()
+			rt.status = StatusRunning
+			rt.ready = true
+			rt.proxyTarget = target
+			rt.blockedByPort = false
+			rt.lastError = ""
+			rt.mu.Unlock()
 		}
 		return
 	}
@@ -1062,26 +1124,32 @@ func (rt *appRuntime) refreshObservedState(client *http.Client) {
 	}
 }
 
-func (rt *appRuntime) probeReady(client *http.Client) bool {
-	if !probeTCP(rt.cfg.Port) {
-		return false
+func (rt *appRuntime) probeReady(client *http.Client) (bool, string) {
+	var lastErr error
+	for _, target := range loopbackTargets(rt.cfg.Port) {
+		if !probeTCPTarget(target) {
+			continue
+		}
+		req, err := http.NewRequest(rt.cfg.HealthMethod, target+rt.cfg.HealthPath, nil)
+		if err != nil {
+			return true, target
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			return true, target
+		}
+		log.Printf("app %s health probe returned HTTP %d on %s", rt.cfg.ID, resp.StatusCode, target)
 	}
-	req, err := http.NewRequest(rt.cfg.HealthMethod, fmt.Sprintf("http://127.0.0.1:%d%s", rt.cfg.Port, rt.cfg.HealthPath), nil)
-	if err != nil {
-		return true
+	if lastErr != nil {
+		log.Printf("app %s health probe failed after TCP connect on loopback port %d: %v", rt.cfg.ID, rt.cfg.Port, lastErr)
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("app %s health probe failed after TCP connect on port %d: %v", rt.cfg.ID, rt.cfg.Port, err)
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-		return true
-	}
-	log.Printf("app %s health probe returned HTTP %d on port %d", rt.cfg.ID, resp.StatusCode, rt.cfg.Port)
-	return false
+	return false, ""
 }
 
 func (rt *appRuntime) isReady() bool {
@@ -1265,13 +1333,17 @@ func (rt *appRuntime) stop(reason string) error {
 func (rt *appRuntime) snapshot() AppState {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	proxyTarget := rt.proxyTarget
+	if strings.TrimSpace(proxyTarget) == "" {
+		proxyTarget = defaultLoopbackTarget(rt.cfg.Port)
+	}
 	state := AppState{
 		Config:       rt.cfg,
 		Status:       rt.status,
 		LastError:    rt.lastError,
 		Ready:        rt.ready,
 		LogTail:      rt.logs.String(),
-		ProxyTarget:  fmt.Sprintf("http://127.0.0.1:%d", rt.cfg.Port),
+		ProxyTarget:  proxyTarget,
 		PortConflict: clonePortConflict(rt.portConflict),
 	}
 	if rt.cmd != nil && rt.cmd.Process != nil {
@@ -1484,7 +1556,20 @@ func normalizeHost(host string) string {
 }
 
 func probeTCP(port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
+	for _, target := range loopbackTargets(port) {
+		if probeTCPTarget(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func probeTCPTarget(target string) bool {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", parsed.Host, 500*time.Millisecond)
 	if err != nil {
 		return false
 	}
