@@ -112,21 +112,19 @@ locally does not require a password.
    (default `9443`), machine name, and shared username/password.
 2. Enable **Share on LAN** for each app, then open its **LAN sharing on** link.
    Apps use separate Bonjour names on one port, such as
-   `https://my-app-my-mac.local:9443/`; backend ports stay unchanged.
+   `https://my-app-my-mac.local:9443/`, backend ports stay unchanged.
 3. Download the **CA certificate** from Setup and trust it on visiting devices.
-   **Only trust a Mac you control. Transfer the public certificate, never its
-   private key, and do not disable certificate verification.**
 
 ### Security Protections
 
-- **Authenticated HTTPS:** one set of credentials covers shared apps; passwords
+- **Authenticated HTTPS:** one set of credentials covers shared apps. Passwords
   are stored as bcrypt hashes. Keep backends on loopback to prevent bypass.
 - **Per-app sessions:** Secure, HttpOnly cookies last up to 12 hours. Sessions end
   on Teely restart or changes to LAN credentials, sharing settings, or hostnames.
   Visit `/__teely/lan/login` on an app to sign out.
 - **Login protection:** 10 attempts per minute per client IP across shared apps,
   plus cross-origin request protections. Clients behind the same NAT/proxy share
-  a limit; this is not protection against distributed attacks.
+  a limit. This is not protection against distributed attacks.
 
 Bonjour discovery can be blocked by VPNs or guest Wi-Fi.
 
