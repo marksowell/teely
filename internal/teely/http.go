@@ -123,6 +123,12 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			ErrorCount:      statusCount(apps, StatusError),
 		})
 		return
+	case r.Method == http.MethodGet && r.URL.Path == "/__teely/events":
+		m.serveDashboardEvents(w, r)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/__teely/cards":
+		m.serveDashboardCards(w, r)
+		return
 	case r.Method == http.MethodGet && r.URL.Path == "/__teely/apps":
 		writeJSON(w, http.StatusOK, m.ListApps())
 		return
@@ -1503,12 +1509,12 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     <main class="main">
       {{ if .Notice }}<div class="notice-wrap"><div class="notice">{{ .Notice }}</div><a class="button-link secondary" href="/">Dismiss</a></div>{{ end }}
       {{ if .ErrorMessage }}<div class="notice-wrap notice error-banner"><pre style="flex:1;">{{ .ErrorMessage }}</pre><a class="button-link secondary" href="/">Dismiss</a></div>{{ end }}
-      <section class="stats">
+      {{ block "app-stats" . }}<section class="stats" id="app-stats">
         <div class="stat"><div class="stat-label">Registered apps</div><div class="stat-value">{{ len .Apps }}</div></div>
         <div class="stat"><div class="stat-label">Running</div><div class="stat-value">{{ .RunningCount }}</div></div>
         <div class="stat"><div class="stat-label">Starting</div><div class="stat-value">{{ .StartingCount }}</div></div>
         <div class="stat"><div class="stat-label">Needs attention</div><div class="stat-value">{{ .ErrorCount }}</div></div>
-      </section>
+      </section>{{ end }}
 
       <section class="summary-grid">
         <section class="panel">
@@ -1526,10 +1532,10 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
               {{ end }}
             </div>
           </div>
-          <div class="stack">
+          {{ block "app-cards" . }}<div class="stack" id="app-cards">
             {{ if .Apps }}
             {{ range .Apps }}
-            <article class="app-card">
+            <article class="app-card" data-app-id="{{ .Config.ID }}">
               <div class="app-row">
                 <div class="app-identity">
                   <h3>{{ .Config.Name }}</h3>
@@ -1606,7 +1612,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
             {{ else }}
             <div class="empty">No apps registered yet. Teely will open an add-app walkthrough automatically on first launch.</div>
             {{ end }}
-          </div>
+          </div>{{ end }}
         </section>
 
         <aside class="panel">
@@ -1845,7 +1851,6 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
 
   <script>
     (() => {
-      const initialApps = {{ toJSON .Apps }};
       const storageKey = "teely.theme";
       const root = document.documentElement;
       const select = document.getElementById("theme-select");
@@ -1889,52 +1894,49 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         window.history.replaceState({}, "", next);
       }
 
-      const normalizeApps = (apps) => JSON.stringify(
-        (Array.isArray(apps) ? apps : []).map((app) => ({
-          id: app.config?.id || "",
-          status: app.status || "",
-          ready: Boolean(app.ready),
-          pid: app.pid || 0,
-          lastError: app.last_error || "",
-          conflictPid: app.port_conflict?.pid || 0,
-          conflictManaged: Boolean(app.port_conflict?.managed_by_teely),
-          networkLabel: app.network_label || "",
-          networkDetail: app.network_detail || "",
-          lanURL: app.lan_url || "",
-          lanUnavailable: Boolean(app.lan_unavailable),
-        }))
-      );
-      let baselineApps = normalizeApps(initialApps);
-      let refreshTimer = null;
-      const poll = async () => {
+      let updatingCards = false;
+      let cardsDirty = false;
+      const refreshCards = async () => {
+        cardsDirty = true;
+        if (updatingCards) return;
+        updatingCards = true;
         try {
-          const response = await fetch("/__teely/apps", { cache: "no-store" });
-          if (!response.ok) {
-            refreshTimer = window.setTimeout(poll, 2500);
-            return;
-          }
-          const apps = await response.json();
-          const nextApps = normalizeApps(apps);
-          if (nextApps !== baselineApps) {
-            if (!document.querySelector(".modal-shell")) {
-              window.location.reload();
-              return;
+          while (cardsDirty) {
+            cardsDirty = false;
+            const response = await fetch("/__teely/cards", { cache: "no-store" });
+            if (!response.ok) throw new Error("Dashboard update failed");
+            const doc = new DOMParser().parseFromString(await response.text(), "text/html");
+            const current = document.getElementById("app-cards");
+            const incoming = doc.getElementById("app-cards");
+            if (!incoming || !doc.getElementById("app-stats")) throw new Error("Invalid dashboard update");
+            const existing = new Map([...current.querySelectorAll("[data-app-id]")].map(card => [card.dataset.appId, card]));
+            for (const card of incoming.querySelectorAll("[data-app-id]")) {
+              const previous = existing.get(card.dataset.appId);
+              if (previous) {
+                card.querySelector("details").open = previous.querySelector("details").open;
+                if (card.outerHTML === previous.outerHTML) card.replaceWith(previous);
+              }
             }
-            baselineApps = nextApps;
+            current.replaceChildren(...incoming.childNodes);
+            document.getElementById("app-stats").replaceChildren(...doc.getElementById("app-stats").childNodes);
           }
-          refreshTimer = window.setTimeout(poll, 2500);
         } catch (_) {
-          refreshTimer = window.setTimeout(poll, 3000);
+          // EventSource reconnects independently; also retry when the tab is revisited.
+          cardsDirty = true;
+        } finally {
+          updatingCards = false;
         }
       };
-      if (Array.isArray(initialApps) && initialApps.length > 0) {
-        refreshTimer = window.setTimeout(poll, 1500);
-        window.addEventListener("beforeunload", () => {
-          if (refreshTimer !== null) {
-            window.clearTimeout(refreshTimer);
-          }
-        });
-      }
+      let appEvents;
+      const connectEvents = () => {
+        if (appEvents) appEvents.close();
+        appEvents = new EventSource("/__teely/events");
+        appEvents.onmessage = refreshCards;
+      };
+      connectEvents();
+      window.addEventListener("pagehide", () => appEvents.close());
+      window.addEventListener("pageshow", (event) => { if (event.persisted) connectEvents(); });
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCards(); });
 
       const appFieldNames = [
         "id",

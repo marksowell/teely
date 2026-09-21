@@ -76,20 +76,23 @@ type SetupState struct {
 type Manager struct {
 	configPath string
 
-	mu             sync.RWMutex
-	config         *Config
-	runtimes       map[string]*appRuntime
-	hostToApp      map[string]string
-	httpClient     *http.Client
-	aiModelOptions map[string][]AIModelOption
-	aiModelErrors  map[string]string
-	bonjour        *bonjourState
-	lanAvailable   bool
-	lanAuth        lanAuthState
+	mu              sync.RWMutex
+	config          *Config
+	runtimes        map[string]*appRuntime
+	hostToApp       map[string]string
+	httpClient      *http.Client
+	aiModelOptions  map[string][]AIModelOption
+	aiModelErrors   map[string]string
+	bonjour         *bonjourState
+	lanAvailable    bool
+	lanAuth         lanAuthState
+	dashboardEvents dashboardEvents
 }
 
 type appRuntime struct {
-	cfg AppConfig
+	cfg           AppConfig
+	onChange      func()
+	lastPublished runtimeEventState
 
 	mu            sync.Mutex
 	status        AppStatus
@@ -699,6 +702,7 @@ func (m *Manager) commitConfigLocked(next *Config) error {
 		m.lanAuth.revoke()
 	}
 	m.reconcileBonjourLocked()
+	m.dashboardEvents.publish()
 	return nil
 }
 
@@ -849,6 +853,7 @@ func (m *Manager) rebuildFromConfigLocked() {
 			continue
 		}
 		newRuntimes[app.ID] = newAppRuntime(app)
+		newRuntimes[app.ID].onChange = m.dashboardEvents.publish
 	}
 	m.runtimes = newRuntimes
 	m.hostToApp = hostToApp
@@ -928,6 +933,7 @@ func loopbackTargets(port int) []string {
 var errAlreadyStopped = errors.New("already stopped")
 
 func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) error {
+	defer rt.publishState()
 	rt.mu.Lock()
 	switch rt.status {
 	case StatusRunning:
@@ -1053,6 +1059,7 @@ func (rt *appRuntime) ensureStarted(client *http.Client, allowAutoStart bool) er
 }
 
 func (rt *appRuntime) watchProcess(cmd *exec.Cmd, waitDone chan struct{}) {
+	defer rt.publishState()
 	defer close(waitDone)
 	err := cmd.Wait()
 	rt.mu.Lock()
@@ -1099,6 +1106,7 @@ func (rt *appRuntime) watchProcess(cmd *exec.Cmd, waitDone chan struct{}) {
 }
 
 func (rt *appRuntime) waitUntilReady(client *http.Client) {
+	defer rt.publishState()
 	timeout, _ := appParsedStartupTimeout(rt.cfg)
 	deadline := time.Now().Add(timeout)
 	log.Printf("waiting for app %s readiness on loopback port %d%s for up to %s", rt.cfg.ID, rt.cfg.Port, rt.cfg.HealthPath, timeout)
@@ -1153,6 +1161,7 @@ func (rt *appRuntime) waitUntilReady(client *http.Client) {
 }
 
 func (rt *appRuntime) refreshObservedState(client *http.Client) {
+	defer rt.publishState()
 	rt.mu.Lock()
 	cmdActive := rt.cmd != nil
 	managedPID := rt.managedPID
@@ -1331,6 +1340,7 @@ func (rt *appRuntime) stopIfIdle() {
 }
 
 func (rt *appRuntime) stop(reason string) error {
+	defer rt.publishState()
 	rt.mu.Lock()
 	if rt.cmd == nil || rt.cmd.Process == nil {
 		if rt.managedPID != 0 {
@@ -1506,6 +1516,7 @@ func (rt *appRuntime) ownsListener(conflict *PortConflict) bool {
 }
 
 func (rt *appRuntime) clearPortConflict() {
+	defer rt.publishState()
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.portConflict = nil

@@ -238,6 +238,7 @@ func (m *Manager) checkLANNetworkLocked() {
 		return
 	}
 	m.reconcileBonjourLocked()
+	m.dashboardEvents.publish()
 }
 
 func (m *Manager) lanError() string {
