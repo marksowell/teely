@@ -176,7 +176,10 @@ func writeCaddyfile(configPath string, cfg *teely.Config) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.Caddy.CaddyfilePath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.Caddy.CaddyfilePath, []byte(manager.CaddySnippet()), 0o644); err != nil {
+	if err := os.WriteFile(cfg.Caddy.CaddyfilePath, []byte(manager.CaddyRuntimeConfig()), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(cfg.Caddy.CaddyfilePath, 0o600); err != nil {
 		return err
 	}
 	fmt.Printf("Wrote Caddyfile:\n  %s\n", cfg.Caddy.CaddyfilePath)

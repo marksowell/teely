@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -84,6 +85,7 @@ func TestListenerOwnedByCommandRecognizesChildListener(t *testing.T) {
 	listener.Close()
 
 	cmd := exec.Command("/bin/sh", "-c", "python3 -m http.server "+portText+" --bind ::1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +170,7 @@ func TestStopCleansTeelyOwnedListenerWithoutCommandHandle(t *testing.T) {
 	port := mustAtoi(t, portText)
 
 	cmd := exec.Command("/bin/sh", "-c", "python3 -m http.server "+portText+" --bind ::1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -32,17 +32,22 @@ const (
 )
 
 type AppState struct {
-	Config       AppConfig     `json:"config"`
-	Status       AppStatus     `json:"status"`
-	PID          int           `json:"pid,omitempty"`
-	LastUsedAt   *time.Time    `json:"last_used_at,omitempty"`
-	StartedAt    *time.Time    `json:"started_at,omitempty"`
-	LastError    string        `json:"last_error,omitempty"`
-	ExitCode     *int          `json:"exit_code,omitempty"`
-	LogTail      string        `json:"log_tail,omitempty"`
-	Ready        bool          `json:"ready"`
-	ProxyTarget  string        `json:"proxy_target,omitempty"`
-	PortConflict *PortConflict `json:"port_conflict,omitempty"`
+	Config         AppConfig     `json:"config"`
+	Status         AppStatus     `json:"status"`
+	PID            int           `json:"pid,omitempty"`
+	LastUsedAt     *time.Time    `json:"last_used_at,omitempty"`
+	StartedAt      *time.Time    `json:"started_at,omitempty"`
+	LastError      string        `json:"last_error,omitempty"`
+	ExitCode       *int          `json:"exit_code,omitempty"`
+	LogTail        string        `json:"log_tail,omitempty"`
+	Ready          bool          `json:"ready"`
+	ProxyTarget    string        `json:"proxy_target,omitempty"`
+	PortConflict   *PortConflict `json:"port_conflict,omitempty"`
+	LANURL         string        `json:"lan_url,omitempty"`
+	LANUnavailable bool          `json:"lan_unavailable,omitempty"`
+	NetworkLabel   string        `json:"network_label,omitempty"`
+	NetworkDetail  string        `json:"network_detail,omitempty"`
+	NetworkExposed bool          `json:"network_exposed,omitempty"`
 }
 
 type PortConflict struct {
@@ -78,6 +83,9 @@ type Manager struct {
 	httpClient     *http.Client
 	aiModelOptions map[string][]AIModelOption
 	aiModelErrors  map[string]string
+	bonjour        *bonjourState
+	lanAvailable   bool
+	lanAuth        lanAuthState
 }
 
 type appRuntime struct {
@@ -123,7 +131,17 @@ func NewManager(configPath string) (*Manager, error) {
 }
 
 func (m *Manager) Close() {
+	m.mu.Lock()
+	if m.bonjour != nil {
+		m.bonjour.stop()
+		m.bonjour = nil
+	}
+	runtimes := make([]*appRuntime, 0, len(m.runtimes))
 	for _, rt := range m.runtimes {
+		runtimes = append(runtimes, rt)
+	}
+	m.mu.Unlock()
+	for _, rt := range runtimes {
 		_ = rt.stop("teely shutting down")
 	}
 }
@@ -131,7 +149,7 @@ func (m *Manager) Close() {
 func (m *Manager) Config() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return *m.config
+	return *cloneConfig(m.config)
 }
 
 func (m *Manager) ListApps() []AppState {
@@ -142,13 +160,28 @@ func (m *Manager) ListApps() []AppState {
 		runtimes[id] = rt
 	}
 	client := m.httpClient
+	lan := m.config.LAN
 	m.mu.RUnlock()
 
+	listeners, listenErr := inspectListeners()
+	lanAvailable := lan.Enabled && lanAddressAvailable(lan.Address)
 	out := make([]AppState, 0, len(apps))
 	for _, app := range apps {
 		if rt := runtimes[app.ID]; rt != nil {
 			rt.refreshObservedState(client)
-			out = append(out, rt.snapshot())
+			state := rt.snapshot()
+			if lan.Enabled && app.ShareLAN {
+				if lanAvailable {
+					state.LANURL = lan.appURL(app)
+				} else {
+					state.LANUnavailable = true
+				}
+			}
+			state.NetworkLabel, state.NetworkDetail, state.NetworkExposed = listenerExposure(listeners[app.Port], listenErr)
+			if state.Status == StatusStopped && listenErr == nil && len(listeners[app.Port]) == 0 {
+				state.NetworkLabel, state.NetworkDetail, state.NetworkExposed = expectedAppExposure(app)
+			}
+			out = append(out, state)
 		}
 	}
 	return out
@@ -183,6 +216,9 @@ func (m *Manager) FindByHost(host string) (AppState, bool) {
 }
 
 func (m *Manager) HandleAppRequest(w http.ResponseWriter, r *http.Request) {
+	if m.handleLANRequest(w, r) {
+		return
+	}
 	host := normalizeHost(r.Host)
 	m.mu.RLock()
 	id, ok := m.hostToApp[host]
@@ -586,6 +622,17 @@ func shellQuote(value string) string {
 func (m *Manager) CaddySnippet() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	text := m.caddySnippetLocked()
+	if hash := m.config.LAN.PasswordHash; hash != "" {
+		text = strings.ReplaceAll(text, hash, "<redacted-password-hash>")
+	}
+	return text
+}
+
+// CaddyRuntimeConfig is for the private generated file, never the dashboard.
+func (m *Manager) CaddyRuntimeConfig() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.caddySnippetLocked()
 }
 
@@ -596,11 +643,14 @@ func (m *Manager) syncCaddyLocked() error {
 	if err := os.MkdirAll(filepath.Dir(m.config.Caddy.CaddyfilePath), 0o755); err != nil {
 		return fmt.Errorf("prepare caddyfile directory: %w", err)
 	}
-	if err := os.WriteFile(m.config.Caddy.CaddyfilePath, []byte(m.caddySnippetLocked()), 0o644); err != nil {
+	if err := writePrivateFile(m.config.Caddy.CaddyfilePath, []byte(m.caddySnippetLocked())); err != nil {
 		return fmt.Errorf("write caddyfile: %w", err)
 	}
 	if _, err := os.Stat(m.config.Caddy.BinaryPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if m.config.LAN.Enabled {
+				return errors.New("install Caddy before enabling LAN access")
+			}
 			return nil
 		}
 		return fmt.Errorf("check caddy binary: %w", err)
@@ -618,6 +668,9 @@ func (m *Manager) syncCaddyLocked() error {
 }
 
 func (m *Manager) commitConfigLocked(next *Config) error {
+	if err := validateLAN(next); err != nil {
+		return err
+	}
 	previous := cloneConfig(m.config)
 	if err := SaveConfig(m.configPath, next); err != nil {
 		return err
@@ -642,6 +695,10 @@ func (m *Manager) commitConfigLocked(next *Config) error {
 			return err
 		}
 	}
+	if lanAuthConfig(previous) != lanAuthConfig(next) {
+		m.lanAuth.revoke()
+	}
+	m.reconcileBonjourLocked()
 	return nil
 }
 
@@ -650,6 +707,7 @@ func (m *Manager) caddySnippetLocked() string {
 	var b strings.Builder
 	b.WriteString("{\n")
 	b.WriteString("\tlocal_certs\n")
+	b.WriteString("\tauto_https disable_redirects\n\torder abort first\n")
 	b.WriteString("\tskip_install_trust\n")
 	b.WriteString("\tpki {\n")
 	b.WriteString("\t\tca local {\n")
@@ -660,7 +718,7 @@ func (m *Manager) caddySnippetLocked() string {
 	sharedHosts := combinedLocalhostHosts(cfg)
 	if len(sharedHosts) > 0 {
 		fmt.Fprintf(&b, "%s {\n", strings.Join(sharedHosts, ", "))
-		b.WriteString("\tbind 0.0.0.0 ::\n")
+		writeLocalAccessGuard(&b)
 		writeTeelyTLS(&b)
 		fmt.Fprintf(&b, "\treverse_proxy %s\n", cfg.ListenAddress)
 		b.WriteString("}\n\n")
@@ -670,7 +728,7 @@ func (m *Manager) caddySnippetLocked() string {
 			continue
 		}
 		fmt.Fprintf(&b, "%s {\n", app.Hostname)
-		b.WriteString("\tbind 0.0.0.0 ::\n")
+		writeLocalAccessGuard(&b)
 		writeTeelyTLS(&b)
 		if strings.TrimSpace(app.CaddyDirectives) != "" {
 			for _, line := range strings.Split(app.CaddyDirectives, "\n") {
@@ -688,7 +746,30 @@ func (m *Manager) caddySnippetLocked() string {
 		}
 		b.WriteString("}\n\n")
 	}
+	writeLANRoutes(&b, cfg)
+	// Explicit wildcard HTTP redirects avoid privileged LAN-address port 80 binds.
+	var redirects []string
+	seen := map[string]bool{}
+	for _, host := range append(sharedHosts, appHostnames(cfg.Apps)...) {
+		if !seen[host] {
+			redirects = append(redirects, "http://"+host)
+			seen[host] = true
+		}
+	}
+	if len(redirects) > 0 {
+		fmt.Fprintf(&b, "%s {\n", strings.Join(redirects, ", "))
+		writeLocalAccessGuard(&b)
+		b.WriteString("\tredir https://{host}{uri} 308\n}\n")
+	}
 	return b.String()
+}
+
+func appHostnames(apps []AppConfig) []string {
+	var hosts []string
+	for _, app := range apps {
+		hosts = append(hosts, app.Hostname)
+	}
+	return hosts
 }
 
 func writeTeelyTLS(b *strings.Builder) {
@@ -777,6 +858,9 @@ func (m *Manager) idleLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		m.mu.Lock()
+		m.checkLANNetworkLocked()
+		m.mu.Unlock()
 		m.mu.RLock()
 		runtimes := make([]*appRuntime, 0, len(m.runtimes))
 		for _, rt := range m.runtimes {

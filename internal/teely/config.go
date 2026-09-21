@@ -19,6 +19,7 @@ type Config struct {
 	RuntimeDir    string      `json:"runtime_dir"`
 	Caddy         CaddyConfig `json:"caddy"`
 	AI            AIConfig    `json:"ai,omitempty"`
+	LAN           LANConfig   `json:"lan,omitempty"`
 	Apps          []AppConfig `json:"apps"`
 }
 
@@ -44,6 +45,7 @@ type AppConfig struct {
 	IdleTimeout     string            `json:"idle_timeout"`
 	StartupTimeout  string            `json:"startup_timeout"`
 	CaddyDirectives string            `json:"caddy_directives,omitempty"`
+	ShareLAN        bool              `json:"share_lan,omitempty"`
 	Env             map[string]string `json:"env,omitempty"`
 }
 
@@ -149,6 +151,9 @@ func LoadConfig(path string) (*Config, error) {
 		seenHosts[strings.ToLower(app.Hostname)] = struct{}{}
 		seenPorts[app.Port] = cloneAppConfig(*app)
 	}
+	if err := validateLAN(&cfg); err != nil {
+		return nil, err
+	}
 	slices.SortFunc(cfg.Apps, func(a, b AppConfig) int {
 		return strings.Compare(a.Name, b.Name)
 	})
@@ -162,7 +167,7 @@ func SaveConfig(path string, cfg *Config) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
+	return writePrivateFile(path, data)
 }
 
 func cloneConfig(cfg *Config) *Config {

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	urlpkg "net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -26,8 +28,11 @@ func NewHTTPServer(manager *Manager) *HTTPServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	s.server = &http.Server{
-		Addr:    manager.Config().ListenAddress,
-		Handler: mux,
+		Addr:              manager.Config().ListenAddress,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	return s
 }
@@ -45,6 +50,19 @@ func (s *HTTPServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip := net.ParseIP(peer); ip == nil || !ip.IsLoopback() {
+		http.Error(w, "Teely's dashboard is local to this Mac.", 403)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		origin, err := urlpkg.Parse(r.Header.Get("Origin"))
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" || (r.Header.Get("Origin") != "" && (err != nil || !strings.EqualFold(origin.Host, r.Host))) {
+			http.Error(w, "Cross-origin changes are not allowed.", 403)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	}
 	switch {
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/":
 		apps := m.ListApps()
@@ -98,6 +116,8 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			AIProviders:     supportedAIProviders(),
 			AIConfigError:   aiConfigError,
 			ShowAIDetails:   showAIDetails,
+			ShowLANDetails:  r.URL.Query().Get("lan") != "",
+			LANError:        m.lanError(),
 			RunningCount:    statusCount(apps, StatusRunning),
 			StartingCount:   statusCount(apps, StatusStarting),
 			ErrorCount:      statusCount(apps, StatusError),
@@ -127,6 +147,9 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/__teely/import":
 		m.handleImport(w, r)
 		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/suggest-loopback":
+		m.handleSuggestLoopback(w, r)
+		return
 	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/save":
 		m.handleAISave(w, r)
 		return
@@ -135,6 +158,19 @@ func (m *Manager) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.Method == http.MethodPost && r.URL.Path == "/__teely/ai/delete-key":
 		m.handleAIDeleteKey(w, r)
+		return
+	case r.Method == http.MethodPost && r.URL.Path == "/__teely/lan/save":
+		m.handleLANSave(w, r)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/__teely/lan/certificate":
+		path, err := findCaddyRootCertPath()
+		if err != nil {
+			http.Error(w, "Caddy CA certificate is not available yet.", 404)
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="teely-local-ca.crt"`)
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, path)
 		return
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/__teely/setup/"):
 		m.handleSetupAction(w, r)
@@ -243,6 +279,7 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 			IdleTimeout:     strings.TrimSpace(r.FormValue("idle_timeout")),
 			StartupTimeout:  strings.TrimSpace(r.FormValue("startup_timeout")),
 			CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
+			ShareLAN:        r.FormValue("share_lan") == "on",
 		}
 		m.renderRegisterFormError(w, app, "Port must be a number.", isEditing)
 		return
@@ -259,6 +296,7 @@ func (m *Manager) handleRegister(w http.ResponseWriter, r *http.Request) {
 		IdleTimeout:     strings.TrimSpace(r.FormValue("idle_timeout")),
 		StartupTimeout:  strings.TrimSpace(r.FormValue("startup_timeout")),
 		CaddyDirectives: strings.TrimSpace(r.FormValue("caddy_directives")),
+		ShareLAN:        r.FormValue("share_lan") == "on",
 	}
 	existing, exists := m.GetAppByID(app.ID)
 	if isEditing && !exists {
@@ -491,32 +529,36 @@ func renderAppCaddyBlock(app AppConfig, listenAddress string) string {
 }
 
 type dashboardView struct {
-	Config          Config
-	Version         string
-	Apps            []AppState
-	CaddySnippet    string
-	Editing         *AppState
-	Deleting        *AppState
-	Setup           SetupState
-	Notice          string
-	ErrorMessage    string
-	ShowModal       bool
-	IsEditing       bool
-	Importing       bool
-	FormState       AppState
-	NeedsOnboarding bool
-	AIEnabled       bool
-	AIConfigError   string
-	AIProviders     []AIProviderOption
-	ShowAIDetails   bool
-	ImportNotice    string
-	ImportError     string
-	ImportPath      string
-	FormError       string
-	PortError       string
-	RunningCount    int
-	StartingCount   int
-	ErrorCount      int
+	Config           Config
+	Version          string
+	Apps             []AppState
+	CaddySnippet     string
+	Editing          *AppState
+	Deleting         *AppState
+	Setup            SetupState
+	Notice           string
+	ErrorMessage     string
+	ShowModal        bool
+	IsEditing        bool
+	Importing        bool
+	FormState        AppState
+	NeedsOnboarding  bool
+	AIEnabled        bool
+	AIConfigError    string
+	AIProviders      []AIProviderOption
+	ShowAIDetails    bool
+	ImportNotice     string
+	ImportError      string
+	ImportPath       string
+	FormError        string
+	PortError        string
+	RunningCount     int
+	StartingCount    int
+	ErrorCount       int
+	ShowLANDetails   bool
+	LANError         string
+	LANAddresses     []string
+	LANPasswordSaved bool
 }
 
 func restartRequiredForView(app AppState) bool {
@@ -524,6 +566,27 @@ func restartRequiredForView(app AppState) bool {
 }
 
 func renderDashboard(w http.ResponseWriter, view dashboardView) {
+	view.LANAddresses = lanAddresses()
+	view.LANPasswordSaved = view.Config.LAN.PasswordHash != ""
+	view.Config.LAN.PasswordHash = ""
+	if view.Config.LAN.Port == 0 {
+		view.Config.LAN.Port = 9443
+	}
+	if view.Config.LAN.Address == "" && len(view.LANAddresses) > 0 {
+		view.Config.LAN.Address = view.LANAddresses[0]
+	}
+	if view.Config.LAN.Username == "" {
+		view.Config.LAN.Username = "teely"
+	}
+	if view.Config.LAN.Suffix == "" {
+		name, _ := os.Hostname()
+		name = strings.ToLower(strings.TrimSuffix(name, ".local"))
+		if !lanLabel.MatchString(name) {
+			name = "mac"
+		}
+		view.Config.LAN.Suffix = name
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = dashboardTemplate.Execute(w, view)
 }
@@ -889,7 +952,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     }
     .app-row {
       display: grid;
-      grid-template-columns: minmax(0, 1.25fr) minmax(240px, 0.85fr);
+      grid-template-columns: minmax(0, 1fr) minmax(0, 14rem);
       grid-template-areas:
         "identity runtime"
         "conflict conflict"
@@ -961,6 +1024,15 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       overflow-wrap: anywhere;
     }
     .actions, .setup-actions, .form-actions, .panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .network-state { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; font-size:0.85rem; color:var(--muted); }
+    .network-state svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.7; flex-shrink:0; }
+    .network-state span, .network-state a { display:inline-flex; align-items:center; gap:6px; }
+    .network-state .sharing-on { color:var(--accent); }
+    .network-state .suggest-fix { color:var(--accent); text-decoration:underline; text-underline-offset:3px; }
+    .network-warning { color:#a0442d; }
+    .lan-form { display:grid; gap:18px; }
+    .lan-toggle { display:flex; align-items:center; gap:10px; }
+    .lan-toggle input { width:auto; margin:0; accent-color:var(--accent); }
     .panel-actions {
       justify-content: flex-end;
     }
@@ -1183,7 +1255,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
 .setup-ai-key {
   width: 100%;
 }
-.setup-ai-detail-body {
+.setup-ai-detail-body, .setup-lan-detail-body {
   display: grid;
   gap: 10px;
   font-family: inherit;
@@ -1347,6 +1419,8 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     }
     input[readonly] { opacity: 0.72; }
     .code-note { line-height: 1.5; }
+    .certificate-link { display: inline-flex; align-items: center; gap: .3em; vertical-align: middle; text-decoration: underline; text-underline-offset: .15em; }
+    .certificate-link svg { width: 1em; height: 1em; flex-shrink: 0; }
     pre {
       margin: 0; white-space: pre-wrap; overflow: auto; border-radius: 8px; border: 1px solid var(--line);
       background: var(--panel-muted); color: var(--text); padding: 12px; font-family: var(--font-mono);
@@ -1465,6 +1539,11 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
                     <span class="mono">port {{ .Config.Port }}</span>
                   </div>
                   <div class="subtle" style="margin-top:6px;">{{ .Config.WorkingDir }}</div>
+                  <div class="network-state">
+                    {{ if .LANURL }}<a class="sharing-on" href="{{ .LANURL }}" target="_blank" rel="noreferrer" title="Password-protected LAN URL"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>LAN sharing on</a>{{ else if .LANUnavailable }}<span title="The configured LAN address is unavailable on this network">LAN sharing paused</span>{{ else }}<span title="Teely is not sharing this app on the LAN. Its own listener is checked separately."><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="5"/><circle cx="8" cy="12" r="2"/></svg>LAN sharing off</span>{{ end }}
+                    {{ if .NetworkLabel }}<span class="{{ if .NetworkExposed }}network-warning{{ end }}" title="{{ .NetworkDetail }}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><path d="M12 8v5M5 17v-4h14v4"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/></svg>{{ .NetworkLabel }}</span>{{ end }}
+                  </div>
+                  {{ if .NetworkExposed }}<div class="network-state network-warning">{{ .NetworkDetail }}{{ if $.AIEnabled }}<a class="suggest-fix" href="/?edit={{ .Config.ID }}&amp;suggest_loopback=1"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 9.5 5l3.5 1.5L9.5 8 8 11.5 6.5 8 3 6.5 6.5 5 8 1.5Z"/><path d="m12 10 1 2 2 1-2 1-1 2-1-2-2-1 2-1Z"/></svg>Suggest fix</a>{{ end }}</div>{{ end }}
                 </div>
                 <div class="runtime-meta">
                   <span class="status-pill {{ .Status }}">{{ .Status }}</span>
@@ -1488,7 +1567,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
                 {{ end }}
                 <div class="actions">
                   <form class="inline" method="post" action="/__teely/apps/{{ .Config.ID }}/start"><button {{ if or (eq .Status "running") (eq .Status "starting") }}disabled aria-disabled="true"{{ end }}>Start</button></form>
-                  <form class="inline" method="post" action="/__teely/apps/{{ .Config.ID }}/restart"><button class="secondary">Restart</button></form>
+                  <form class="inline" method="post" action="/__teely/apps/{{ .Config.ID }}/restart"><button class="secondary" {{ if eq .Status "stopped" }}disabled aria-disabled="true"{{ end }}>Restart</button></form>
                   <form class="inline" method="post" action="/__teely/apps/{{ .Config.ID }}/stop"><button class="secondary" {{ if and (ne .Status "running") (ne .Status "starting") }}disabled aria-disabled="true"{{ end }}>Stop</button></form>
                   {{ if and .PortConflict (not .PortConflict.ManagedByTeely) }}
                   <form class="inline" method="post" action="/__teely/apps/{{ .Config.ID }}/terminate-port-owner"><button class="secondary">Terminate Port Owner</button></form>
@@ -1557,6 +1636,33 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
                 {{ end }}
               </div>
               {{ end }}
+              <div class="setup-item" id="lan-access">
+                <div class="setup-main"><h3>LAN Access</h3></div>
+                <div class="setup-actions">
+                  <span class="status-pill {{ if .Config.LAN.Enabled }}running{{ else }}stopped{{ end }}">{{ if .Config.LAN.Enabled }}Enabled{{ else }}Disabled{{ end }}</span>
+                  {{ if .Config.LAN.Enabled }}<form class="inline" method="post" action="/__teely/lan/save"><input type="hidden" name="disable" value="yes"><button class="secondary">Disable</button></form>{{ end }}
+                </div>
+                <details class="setup-detail" {{ if .ShowLANDetails }}open{{ end }}>
+                  <summary>Details</summary>
+                  <div class="setup-detail-body setup-lan-detail-body">
+                    {{ if .LANError }}<div class="notice error">{{ .LANError }}</div>{{ end }}
+                    <form class="lan-form" method="post" action="/__teely/lan/save">
+                      <label class="lan-toggle"><input type="checkbox" name="enabled" {{ if .Config.LAN.Enabled }}checked{{ end }}>Enable LAN access</label>
+                      <div class="field-grid">
+                        <label>LAN Address<input name="address" list="lan-addresses" value="{{ .Config.LAN.Address }}" required><datalist id="lan-addresses">{{ range .LANAddresses }}<option value="{{ . }}">{{ end }}</datalist></label>
+                        <label>Shared HTTPS Port<input type="number" name="lan_port" min="1024" max="65535" value="{{ .Config.LAN.Port }}" required></label>
+                      </div>
+                      <label>Machine Name<input name="suffix" value="{{ .Config.LAN.Suffix }}" required pattern="[a-z0-9][a-z0-9-]*" maxlength="63"></label>
+                      <div class="code-note">Shared apps use https://app-id-{{ .Config.LAN.Suffix }}.local:{{ .Config.LAN.Port }}. Bonjour discovers them on the same LAN without changing DNS settings.</div>
+                      <label>Username<input name="username" value="{{ .Config.LAN.Username }}" autocomplete="username" required></label>
+                      <label>Password<input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72" placeholder="{{ if .LANPasswordSaved }}Leave blank to keep the saved password{{ else }}At least 12 characters{{ end }}"></label>
+                      <div class="code-note">One LAN password protects all shared apps. Visitors sign in through Teely and stay signed in for up to 12 hours per app. Only the password's bcrypt hash is saved. The dashboard stays local.</div>
+                      <div class="code-note">Trust the <a class="certificate-link" href="/__teely/lan/certificate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 20H5V3h14v10M8 7h8M8 11h5"/><circle cx="17" cy="16" r="3"/><path d="m15 18.5-1 4 3-1.5 3 1.5-1-4"/></svg><span>CA certificate</span></a> on each visiting device once.</div>
+                      <div class="form-actions"><button>Save</button></div>
+                    </form>
+                  </div>
+                </details>
+              </div>
               <div class="setup-item" id="ai-configuration">
                 <div class="setup-main">
                   <h3 class="setup-ai-title"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 9.5 5l3.5 1.5L9.5 8 8 11.5 6.5 8 3 6.5 6.5 5 8 1.5Z"></path><path d="M12.25 11.25 12.85 12.65 14.25 13.25 12.85 13.85 12.25 15.25 11.65 13.85 10.25 13.25 11.65 12.65 12.25 11.25Z"></path></svg>AI Configuration</h3>
@@ -1681,6 +1787,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         <div class="notice">Editing <strong>{{ .FormState.Config.Name }}</strong>. Changing the hostname updates routing to the new URL after save.</div>
         {{ end }}
         <form class="modal-form" method="post" action="/__teely/register" {{ if .IsEditing }}data-original-app='{{ toJSON .FormState.Config }}' data-app-active="{{ if restartRequiredForView .FormState }}true{{ else }}false{{ end }}"{{ end }}>
+          {{ if and .IsEditing .AIEnabled }}<div class="notice" data-loopback-suggestion role="status" hidden></div>{{ end }}
           <input type="hidden" name="form_mode" value="{{ if .IsEditing }}edit{{ else }}create{{ end }}">
           {{ if .FormError }}<div class="notice danger-banner">{{ .FormError }}</div>{{ end }}
           <div class="field-grid">
@@ -1719,6 +1826,8 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
               </div>
             </div>
           </details>
+          <label class="lan-toggle"><input type="checkbox" name="share_lan" {{ if .FormState.Config.ShareLAN }}checked{{ end }}>Share on LAN</label>
+          <div class="code-note">{{ if .Config.LAN.Enabled }}Uses the shared HTTPS port and LAN Access password. Your app's own port is unchanged.{{ else }}LAN Access is disabled. Configure it in Setup before this app can be reached over the network.{{ end }}</div>
           {{ if .IsEditing }}
           <div class="notice" data-restart-warning hidden>Changing the port, command, working directory, health check, or custom Caddy directives will stop and restart this app.</div>
           {{ end }}
@@ -1789,6 +1898,10 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           lastError: app.last_error || "",
           conflictPid: app.port_conflict?.pid || 0,
           conflictManaged: Boolean(app.port_conflict?.managed_by_teely),
+          networkLabel: app.network_label || "",
+          networkDetail: app.network_detail || "",
+          lanURL: app.lan_url || "",
+          lanUnavailable: Boolean(app.lan_unavailable),
         }))
       );
       let baselineApps = normalizeApps(initialApps);
@@ -1803,8 +1916,11 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           const apps = await response.json();
           const nextApps = normalizeApps(apps);
           if (nextApps !== baselineApps) {
-            window.location.reload();
-            return;
+            if (!document.querySelector(".modal-shell")) {
+              window.location.reload();
+              return;
+            }
+            baselineApps = nextApps;
           }
           refreshTimer = window.setTimeout(poll, 2500);
         } catch (_) {
@@ -1869,6 +1985,8 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           const value = app[name];
           input.value = value === null || typeof value === "undefined" ? "" : String(value);
         });
+        const shared = form.querySelector('[name="share_lan"]');
+        if (shared && typeof app.share_lan === "boolean") shared.checked = app.share_lan;
         return { ok: true, message: "Applied JSON to the form." };
       };
       document.querySelectorAll("[data-app-json-source]").forEach((source) => {
@@ -1947,6 +2065,50 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         });
         syncRestartState();
       });
+
+      const suggestionParams = new URLSearchParams(window.location.search);
+      const suggestionForm = document.querySelector('form[data-original-app]');
+      const suggestionNotice = suggestionForm && suggestionForm.querySelector('[data-loopback-suggestion]');
+      if (suggestionParams.get("suggest_loopback") === "1" && suggestionNotice) {
+        suggestionParams.delete("suggest_loopback");
+        window.history.replaceState({}, "", "/?" + suggestionParams.toString());
+        const submit = suggestionForm.querySelector('[data-submit-label]');
+        const command = suggestionForm.querySelector('[name="command"]');
+        const directory = suggestionForm.querySelector('[name="working_dir"]');
+        const port = suggestionForm.querySelector('[name="port"]');
+        const originalCommand = command.value;
+        const originalDirectory = directory.value;
+        const originalPort = port.value;
+        let suggesting = true;
+        suggestionForm.addEventListener("submit", (event) => { if (suggesting) event.preventDefault(); });
+        submit.disabled = true;
+        suggestionNotice.hidden = false;
+        suggestionNotice.textContent = "AI is inspecting the startup command for a loopback-only fix...";
+        const body = new URLSearchParams({ id: suggestionForm.querySelector('[name="id"]').value });
+        fetch("/__teely/ai/suggest-loopback", { method: "POST", body, credentials: "same-origin" })
+          .then(async (response) => {
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Could not suggest a fix.");
+            if (command.value !== originalCommand || directory.value !== originalDirectory || port.value !== originalPort || result.original_command !== originalCommand) {
+              throw new Error("The command or app settings changed during analysis. No suggestion was applied; reopen Edit App to try again.");
+            }
+            command.value = result.command;
+            command.dispatchEvent(new Event("input", { bubbles: true }));
+            suggestionNotice.textContent = "Loopback-only command suggested. Review it below, then save to apply. Project files are unchanged.";
+            const previous = document.createElement("details");
+            const summary = document.createElement("summary");
+            summary.textContent = "Original command";
+            const code = document.createElement("code");
+            code.textContent = originalCommand;
+            previous.append(summary, code);
+            suggestionNotice.append(previous);
+          })
+          .catch((error) => {
+            suggestionNotice.classList.add("danger-banner");
+            suggestionNotice.textContent = error.message || "Could not suggest a fix. No fields were changed.";
+          })
+          .finally(() => { suggesting = false; submit.disabled = false; });
+      }
 
       document.querySelectorAll('form[action="/__teely/ai/save"]').forEach((form) => {
         const provider = form.querySelector('[name="provider"]');

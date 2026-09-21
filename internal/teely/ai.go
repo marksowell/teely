@@ -162,6 +162,7 @@ func (m *Manager) DraftAppFromProject(ctx context.Context, projectPath string) (
 		Message: fmt.Sprintf("Drafted from %s using %s.", absPath, provider.Label),
 		Path:    absPath,
 	}
+	draft.App.Command = commandForLoopback(draft.App.Command, snapshot)
 
 	normalized, err := normalizeNewApp(m.configPath, draft.App)
 	if err != nil {
@@ -436,6 +437,77 @@ func nextAvailablePort(start int, used map[int]bool) int {
 		}
 	}
 	return start
+}
+
+// Only rewrite simple package scripts whose entry point supports the host flag.
+// Dependencies alone are not evidence that a custom wrapper accepts CLI options.
+func commandForLoopback(command string, snapshot projectSnapshot) string {
+	scriptIndex, flag := loopbackFramework(command, snapshot)
+	if flag == "" {
+		return command
+	}
+	fields := strings.Fields(command)
+	args := append([]string(nil), fields[:scriptIndex+1]...)
+	for i := scriptIndex + 1; i < len(fields); i++ {
+		arg := fields[i]
+		if arg == flag || (flag == "--hostname" && arg == "-H") {
+			if i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, flag+"=") || (flag == "--hostname" && strings.HasPrefix(arg, "-H=")) {
+			continue
+		}
+		args = append(args, arg)
+	}
+	if containsName(fields[:scriptIndex], "npm") && !containsName(args, "--") {
+		args = append(args, "--")
+	}
+	return strings.Join(append(args, flag, "127.0.0.1"), " ")
+}
+
+func loopbackFramework(command string, snapshot projectSnapshot) (int, string) {
+	simple := regexp.MustCompile(`^[a-zA-Z0-9_./:=@ -]+$`)
+	if !simple.MatchString(command) {
+		return -1, ""
+	}
+	fields := strings.Fields(command)
+	start := 0
+	for start < len(fields) && regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:-]+$`).MatchString(fields[start]) {
+		start++
+	}
+	if len(fields)-start < 2 {
+		return -1, ""
+	}
+	pm := fields[start]
+	switch pm {
+	case "npm", "pnpm", "yarn", "bun":
+	default:
+		return -1, ""
+	}
+	scriptIndex := start + 1
+	if fields[scriptIndex] == "run" {
+		scriptIndex++
+	}
+	if scriptIndex >= len(fields) || (fields[scriptIndex] != "dev" && fields[scriptIndex] != "start") {
+		return -1, ""
+	}
+	script := parsePackageJSON(snapshot.Files["package.json"]).Scripts[fields[scriptIndex]]
+	if !simple.MatchString(script) {
+		return -1, ""
+	}
+	entry := strings.Fields(script)
+	flag := ""
+	switch {
+	case len(entry) >= 2 && entry[0] == "next" && (entry[1] == "dev" || entry[1] == "start"):
+		flag = "--hostname"
+	case len(entry) >= 1 && entry[0] == "vite" && (len(entry) == 1 || strings.HasPrefix(entry[1], "-") || entry[1] == "dev" || entry[1] == "serve"):
+		flag = "--host"
+	default:
+		return -1, ""
+	}
+	return scriptIndex, flag
 }
 
 func commandForPort(command string, snapshot projectSnapshot, port int) string {
@@ -1140,12 +1212,20 @@ Prefer:
 - 90s startup_timeout
 
 The command must be something Teely can run directly from the app's working directory.
+Prefer binding the app server to loopback (127.0.0.1 or ::1), not 0.0.0.0 or ::.
+A .localhost URL does not restrict the server's listening interfaces.
+Use a host option only when the actual framework or startup script supports it;
+never invent host flags for custom scripts. Teely's LAN proxy can reach loopback backends.
 `)
 }
 
 func importUserPrompt(snapshot projectSnapshot, base AppConfig) string {
 	var b strings.Builder
-	b.WriteString("Draft a Teely app registration for this project.\n\n")
+	if snapshot.LoopbackFix {
+		b.WriteString("Fix only the existing startup command's listening address to 127.0.0.1. Preserve its package script, port, arguments, environment assignments, and all registration fields. Do not change dev to start or vice versa. Do not edit files. Use only a host flag supported by the actual script. If this cannot be established, return the original command unchanged.\n\n")
+	} else {
+		b.WriteString("Draft a Teely app registration for this project.\n\n")
+	}
 	fmt.Fprintf(&b, "Project path: %s\n", snapshot.Path)
 	fmt.Fprintf(&b, "Directory name: %s\n", snapshot.ProjectName)
 	fmt.Fprintf(&b, "Top-level files: %s\n\n", strings.Join(snapshot.TopLevelFiles, ", "))

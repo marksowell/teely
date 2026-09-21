@@ -7,6 +7,7 @@ type appImportDraft struct {
 }
 
 type projectSnapshot struct {
+	LoopbackFix   bool
 	Path          string
 	ProjectName   string
 	TopLevelFiles []string

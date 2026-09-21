@@ -74,10 +74,11 @@ func serveMain(args []string, defaultConfig string) {
 	defer manager.Close()
 
 	if *printCaddy {
-		fmt.Fprint(os.Stdout, manager.CaddySnippet())
+		fmt.Fprint(os.Stdout, manager.CaddyRuntimeConfig())
 		return
 	}
 
+	manager.StartLAN()
 	server := teely.NewHTTPServer(manager)
 	log.Printf("teely listening on %s", manager.Config().ListenAddress)
 	log.Printf("admin UI hostname: %s", manager.Config().AdminHostname)
@@ -119,7 +120,7 @@ func runPrintCaddy(args []string) {
 		log.Fatalf("load config: %v", err)
 	}
 	defer manager.Close()
-	fmt.Fprint(os.Stdout, manager.CaddySnippet())
+	fmt.Fprint(os.Stdout, manager.CaddyRuntimeConfig())
 }
 
 func runInit(args []string) {

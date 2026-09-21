@@ -77,12 +77,58 @@ The app should already work outside Teely. AI import is meant to save the typing
 AI import also checks existing Teely app ports. When a drafted port is already assigned to another Teely app, it chooses the next available port if it can also update the command safely. For example, a Next.js app that would normally use `npm run dev` on port `3000` can be drafted as:
 
 ```bash
-npm run dev -- -p 3001
+npm run dev -- -p 3001 --hostname 127.0.0.1
 ```
 
 with the app port set to `3001`. If Teely cannot confidently rewrite the command, it leaves the draft alone so the normal validation can catch the port conflict.
 
 AI configuration lives in Teely setup. The provider and model are stored in Teely config, and API keys are securely stored separately in macOS Keychain.
+
+AI import prefers loopback-only commands and adds verified host flags for simple
+Next.js and Vite scripts.
+
+## Local Development Security
+
+**Dev servers can expose your app to the LAN without you realizing it.** Some
+listen on all network interfaces even when you open them through `localhost`.
+Teely helps prevent accidental exposure by preferring loopback-only AI drafts,
+flagging network listeners, and suggesting supported command fixes.
+
+Bind apps to `127.0.0.1` or `::1` to keep backend ports local. Listeners on
+`0.0.0.0`, `::`, or `*` may allow direct LAN access without Teely's password.
+Teely detects this risk but cannot block it.
+
+App cards flag **Direct network listener** or confirm **Loopback only**. With AI
+configured, **Suggest fix** proposes a supported loopback command for your review
+without editing project files.
+
+## LAN Access
+
+**Share apps on your local network only when you choose to.** This is not intended
+for public internet access. The dashboard stays on your Mac, and opening apps
+locally does not require a password.
+
+1. In **Setup > LAN Access**, choose your Mac's private IPv4 address, HTTPS port
+   (default `9443`), machine name, and shared username/password.
+2. Enable **Share on LAN** for each app, then open its **LAN sharing on** link.
+   Apps use separate Bonjour names on one port, such as
+   `https://my-app-my-mac.local:9443/`; backend ports stay unchanged.
+3. Download the **CA certificate** from Setup and trust it on visiting devices.
+   **Only trust a Mac you control. Transfer the public certificate, never its
+   private key, and do not disable certificate verification.**
+
+### Security Protections
+
+- **Authenticated HTTPS:** one set of credentials covers shared apps; passwords
+  are stored as bcrypt hashes. Keep backends on loopback to prevent bypass.
+- **Per-app sessions:** Secure, HttpOnly cookies last up to 12 hours. Sessions end
+  on Teely restart or changes to LAN credentials, sharing settings, or hostnames.
+  Visit `/__teely/lan/login` on an app to sign out.
+- **Login protection:** 10 attempts per minute per client IP across shared apps,
+  plus cross-origin request protections. Clients behind the same NAT/proxy share
+  a limit; this is not protection against distributed attacks.
+
+Bonjour discovery can be blocked by VPNs or guest Wi-Fi.
 
 ## Related Projects
 

@@ -1,10 +1,45 @@
 package teely
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestCommandForLoopback(t *testing.T) {
+	for _, tt := range []struct{ name, script, command, want string }{
+		{"next", "next dev", "npm run dev -- -p 3001", "npm run dev -- -p 3001 --hostname 127.0.0.1"},
+		{"next start", "next start", "npm start", "npm start -- --hostname 127.0.0.1"},
+		{"environment", "next dev", "PORT=3001 npm run dev", "PORT=3001 npm run dev -- --hostname 127.0.0.1"},
+		{"replace host", "next dev", "npm run dev -- --hostname=0.0.0.0 -p 3001", "npm run dev -- -p 3001 --hostname 127.0.0.1"},
+		{"short host", "next dev", "yarn dev -H 0.0.0.0", "yarn dev --hostname 127.0.0.1"},
+		{"vite", "vite", "npm run dev", "npm run dev -- --host 127.0.0.1"},
+		{"vite bare host", "vite", "pnpm run dev --host --port 5174", "pnpm run dev --port 5174 --host 127.0.0.1"},
+		{"bun", "vite", "bun run dev", "bun run dev --host 127.0.0.1"},
+		{"script host", "next dev --hostname 0.0.0.0", "npm run dev", "npm run dev -- --hostname 127.0.0.1"},
+		{"custom wrapper", "node server.js", "npm run dev", "npm run dev"},
+		{"compound script", "next build && next dev", "npm run dev", "npm run dev"},
+		{"compound command", "next dev", "npm run dev && echo done", "npm run dev && echo done"},
+		{"quoted command", "next dev", "npm run dev -- --name 'hello world'", "npm run dev -- --name 'hello world'"},
+		{"unknown command", "next dev", "./start.sh", "./start.sh"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg, err := json.Marshal(map[string]any{"scripts": map[string]string{"dev": tt.script, "start": tt.script}, "dependencies": map[string]string{"next": "14.2.5"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := projectSnapshot{Files: map[string]string{"package.json": string(pkg)}}
+			got := commandForLoopback(tt.command, snapshot)
+			if got != tt.want {
+				t.Fatalf("command = %q, want %q", got, tt.want)
+			}
+			if again := commandForLoopback(got, snapshot); again != got {
+				t.Fatalf("not idempotent: %q -> %q", got, again)
+			}
+		})
+	}
+}
 
 func TestAssignAvailablePortAddsNextPortFlag(t *testing.T) {
 	snapshot := projectSnapshot{

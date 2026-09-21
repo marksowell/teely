@@ -1,6 +1,7 @@
 #!/bin/sh
 
 set -eu
+umask 077
 
 SCRIPT_DIR=$(
   CDPATH= cd -- "$(dirname -- "$0")" && pwd
@@ -25,6 +26,9 @@ fi
 eval "$("${PROJECT_ROOT}/scripts/print-config-paths.sh" "$CONFIG_PATH")"
 OUTPUT_PATH="${2:-${CADDYFILE_PATH}}"
 mkdir -p "$(dirname "$OUTPUT_PATH")"
+if [ -f "$OUTPUT_PATH" ]; then
+  chmod 600 "$OUTPUT_PATH"
+fi
 "$BINARY_PATH" -config "$CONFIG_PATH" -print-caddyfile > "$OUTPUT_PATH"
 
 printf 'Wrote Caddyfile:\n'
