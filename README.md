@@ -132,12 +132,18 @@ Bonjour discovery can be blocked by VPNs or guest Wi-Fi.
 
 Closest projects in this space include [Coulson](https://github.com/ratazzi/coulson), [Tako](https://tako.sh/docs/development/), and [puma-dev](https://github.com/puma/puma-dev). Teely is aimed at the same wake-on-request local workflow, with a built-in dashboard and plain local app commands.
 
-| Project | Start on request | Stop on idle | HTTPS / hostname | Arbitrary local process | macOS-oriented | UI |
-| --- | --- | --- | --- | --- | --- | --- |
-| **Teely** | ✅ | ✅ | ✅ Caddy + `.localhost` | ✅ | ✅ | ✅ |
-| **[Coulson](https://github.com/ratazzi/coulson)** | ✅ | ✅ | ✅ local domains | Partial | Somewhat | ✅ |
-| **[Tako](https://tako.sh/docs/development/)** | ✅ | ✅ | ✅ trusted HTTPS + `.test` | Partial | Somewhat | CLI |
-| **[puma-dev](https://github.com/puma/puma-dev)** | ✅ | ✅ | ✅ HTTPS + local domains | Partial | ✅ | ❌ |
+| Feature | **Teely** | [Coulson](https://github.com/ratazzi/coulson) | [Tako](https://tako.sh/docs/development/) | [puma-dev](https://github.com/puma/puma-dev) |
+| --- | --- | --- | --- | --- |
+| Start on request | ✅ | ✅ | ✅ | ✅ |
+| Stop on idle | ✅ | ✅ | ✅ | ✅ |
+| HTTPS / hostname | Caddy + `.localhost` | HTTPS + local domains | HTTPS + `.test` | HTTPS + local domains |
+| Arbitrary local process | ✅ | Partial | Partial | Partial |
+| macOS-oriented | ✅ | Somewhat | Somewhat | ✅ |
+| UI | Dashboard | Dashboard + menu bar | CLI | CLI |
+| Bonjour/mDNS LAN sharing | Per-app opt-in | Supported | Toggleable LAN mode | Not documented |
+| Public tunnels | Not supported | Cloudflare Tunnel | Tako tunnel service | Not documented |
+| Built-in LAN login | Password + per-app sessions | Not documented | Not documented | Not documented |
+| Backend exposure warnings | Listener detection + AI-assisted fixes | Not documented | Not documented | Not documented |
 
 ## Common Commands
 
