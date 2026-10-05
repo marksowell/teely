@@ -627,6 +627,7 @@ func (m *Manager) renderRegisterFormError(w http.ResponseWriter, app AppConfig, 
 
 func renderStartupPage(w http.ResponseWriter, state AppState) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Refresh", "2")
 	_ = startupTemplate.Execute(w, state)
 }
@@ -2171,6 +2172,7 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="2">
   <title>Starting {{ .Config.Name }}</title>
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; background:linear-gradient(180deg,#f8f5ee,#efe7d8); color:#1f2e28; font-family: ui-rounded, "SF Pro Text", sans-serif; }
@@ -2189,6 +2191,9 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
     <p>The browser will refresh automatically once the app is ready on <code>localhost:{{ .Config.Port }}</code>.</p>
     {{ if .LastError }}<p>Last error: <code>{{ .LastError }}</code></p>{{ end }}
   </div>
+  <script>
+    window.setTimeout(() => window.location.reload(), 2000);
+  </script>
 </body>
 </html>`))
 
