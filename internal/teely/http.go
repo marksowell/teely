@@ -628,8 +628,17 @@ func (m *Manager) renderRegisterFormError(w http.ResponseWriter, app AppConfig, 
 func renderStartupPage(w http.ResponseWriter, state AppState) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	w.Header().Set("Refresh", "2")
 	_ = startupTemplate.Execute(w, state)
+}
+
+func renderAppStartupStatus(w http.ResponseWriter, ready bool) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	if ready {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
 func isDocumentRequest(r *http.Request) bool {
@@ -2172,7 +2181,6 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="2">
   <title>Starting {{ .Config.Name }}</title>
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; background:linear-gradient(180deg,#f8f5ee,#efe7d8); color:#1f2e28; font-family: ui-rounded, "SF Pro Text", sans-serif; }
@@ -2188,11 +2196,31 @@ var startupTemplate = template.Must(template.New("startup").Parse(`<!doctype htm
   <div class="card">
     <h1><span class="pulse"></span>Starting {{ .Config.Name }}</h1>
     <p>Teely saw traffic for <code>{{ .Config.Hostname }}</code> and is starting the app on demand.</p>
-    <p>The browser will refresh automatically once the app is ready on <code>localhost:{{ .Config.Port }}</code>.</p>
+    <p>Teely is waiting for <code>localhost:{{ .Config.Port }}</code> to become ready.</p>
     {{ if .LastError }}<p>Last error: <code>{{ .LastError }}</code></p>{{ end }}
   </div>
   <script>
-    window.setTimeout(() => window.location.reload(), 2000);
+    (() => {
+      const destination = window.location.href;
+      const statusURL = "/.well-known/teely/startup-status";
+      const checkReady = async () => {
+        try {
+          const response = await fetch(statusURL, { cache: "no-store", credentials: "same-origin" });
+          if (response.status === 204) {
+            window.location.replace(destination);
+            return;
+          }
+          if (response.status !== 503) {
+            window.location.replace(destination);
+            return;
+          }
+        } catch (_) {
+          // Keep waiting while the app is still coming online.
+        }
+        window.setTimeout(checkReady, 1000);
+      };
+      window.setTimeout(checkReady, 500);
+    })();
   </script>
 </body>
 </html>`))

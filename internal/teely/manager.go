@@ -242,6 +242,10 @@ func (m *Manager) HandleAppRequest(w http.ResponseWriter, r *http.Request) {
 		renderAppRequestError(w, r, rt.snapshot(), err)
 		return
 	}
+	if r.URL.Path == "/.well-known/teely/startup-status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		renderAppStartupStatus(w, rt.isReady())
+		return
+	}
 
 	if !rt.isReady() {
 		if !isDocumentRequest(r) {
